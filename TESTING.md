@@ -85,7 +85,7 @@ Run on a local self-hosted n8n 2.47.7 on Linux, workflow imported from this `wor
   - Two different callers booking 2:00 PM at the same moment: one booked, the other was told it was just taken. The fake calendar showed the second event created and then deleted, leaving one.
   - The same call sent twice at the same moment: one booked, the other got `duplicate` with the same confirmation code. One event left.
   - Fake Google API turned off: Vapi got an `error` result ("The calendar is not reachable right now. Nothing was booked."), HTTP 200.
-- `test/n8n_e2e.sh`: 5 of the first 6 runs passed. The one failure was the test itself sending the next request less than a second after a reset, before static data had saved. The script now waits a second, and passed every run after that (6 of 6, plus the final runs before publishing).
+- `test/n8n_e2e.sh`: 5 of the first 6 runs passed. The one failure was the test itself sending the next request less than a second after a reset, before static data had saved. The script now waits a second, and passed every run after that: 6 of 6, then 5 of 5 on a fresh n8n 2.47.7 that imported the exact `workflow.json` downloaded back from GitHub.
 - Demo mode, two bookings for the same slot at the same moment: **both were booked.** That is expected (static data is not shared between parallel runs) and is why live use should be on Google mode.
 
 ## Not tested yet
