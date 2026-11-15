@@ -1,0 +1,39 @@
+{
+  "_note": "Two Vapi Function tools. Create each one in Vapi (Tools, Create Tool, Function) or POST each object under tools to https://api.vapi.ai/tool. Put your n8n Production URL for the Booking Tool webhook in server.url.",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "check_availability",
+        "description": "Get open appointment times for one day. Call this before booking. Read back at most three times. Pass the start value of the time the caller picks to book_appointment exactly as given.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "date": { "type": "string", "description": "The day the caller wants, as YYYY-MM-DD in the business time zone." }
+          },
+          "required": ["date"]
+        }
+      },
+      "server": { "url": "https://YOUR-N8N-HOST/webhook/booking-tool" }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "book_appointment",
+        "description": "Book one appointment. Only call this after the caller confirms a time from check_availability. If the result says the time was taken, nothing was booked: offer the other times in the result.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "start": { "type": "string", "description": "Start time exactly as returned by check_availability, for example 2026-11-17T10:00:00-05:00." },
+            "name": { "type": "string", "description": "Caller's name." },
+            "phone": { "type": "string", "description": "Caller's phone number if they gave a different one. Optional." },
+            "service": { "type": "string", "description": "What the appointment is for. Optional." },
+            "notes": { "type": "string", "description": "Anything the owner should know. Optional." }
+          },
+          "required": ["start", "name"]
+        }
+      },
+      "server": { "url": "https://YOUR-N8N-HOST/webhook/booking-tool" }
+    }
+  ]
+}

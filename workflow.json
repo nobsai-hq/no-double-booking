@@ -1,0 +1,683 @@
+{
+  "name": "No Double Booking for AI Phone Agents (No BS AI template)",
+  "nodes": [
+    {
+      "id": "5d7bc428-ebda-4243-9a6f-370e29aeaee9",
+      "name": "Booking Tool",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "booking-tool",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "c494776d-9d9e-452c-bc5e-923c2a1ade39"
+    },
+    {
+      "id": "ba271ff2-83c4-43e5-bca2-4f8a5b2ed488",
+      "name": "Settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// EDIT THESE. Sample values only. Do not put API keys here.\nconst settings = {\n  business_name: 'Sample Barber Shop',\n  timezone: 'America/New_York',\n  // 0 = Sunday ... 6 = Saturday\n  open_days: '1,2,3,4,5,6',\n  open_time: '09:00',\n  close_time: '17:00',\n  // Optional lunch or break. Leave blank for none.\n  break_time: '12:00-13:00',\n  // Length of one appointment, and the gap you want between appointments.\n  slot_minutes: 60,\n  buffer_minutes: 0,\n  // Do not book anything sooner than this many minutes from now.\n  lead_minutes: 60,\n  // How many open times to read back to the caller.\n  max_offer: 3,\n  lookahead_days: 14,\n  // 'demo' keeps a practice calendar inside this workflow. 'google' uses Google Calendar.\n  calendar_mode: 'demo',\n  google_calendar_id: 'primary',\n};\nreturn $input.all().map(item => ({ json: { ...item.json, settings } }));\n"
+      }
+    },
+    {
+      "id": "f7474d47-1c1f-45ef-91f2-035a1f77f0f1",
+      "name": "Parse Tool Calls",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// No BS AI booking logic. Shared, dependency free.\n// The same text is pasted into the n8n Code nodes, run by test_logic.js in Node,\n// and run in the browser sandbox page. Edit here, then run build_workflow.py.\nconst NB = (function () {\n  const WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\n  function pad(n) { return String(n).padStart(2, '0'); }\n  function clean(s) { return String(s == null ? '' : s).replace(/[\\u202f\\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim(); }\n\n  // ---------- time zone helpers (Intl only, no libraries) ----------\n  function partsInTz(ms, tz) {\n    const f = new Intl.DateTimeFormat('en-US', {\n      timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',\n      hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'short',\n    });\n    const o = {};\n    for (const p of f.formatToParts(new Date(ms))) o[p.type] = p.value;\n    return { y: +o.year, m: +o.month, d: +o.day, h: (+o.hour) % 24, mi: +o.minute, s: +o.second, wd: WD.indexOf(o.weekday) };\n  }\n  function tzOffsetMin(ms, tz) {\n    const p = partsInTz(ms, tz);\n    const asUtc = Date.UTC(p.y, p.m - 1, p.d, p.h, p.mi, p.s);\n    return Math.round((asUtc - Math.floor(ms / 1000) * 1000) / 60000);\n  }\n  function localToMs(y, m, d, h, mi, tz) {\n    const guess = Date.UTC(y, m - 1, d, h, mi);\n    const off = tzOffsetMin(guess, tz);\n    let ms = guess - off * 60000;\n    const off2 = tzOffsetMin(ms, tz);\n    if (off2 !== off) ms = guess - off2 * 60000;\n    return ms;\n  }\n  function isoLocal(ms, tz) {\n    const p = partsInTz(ms, tz);\n    const off = tzOffsetMin(ms, tz);\n    const a = Math.abs(off);\n    return p.y + '-' + pad(p.m) + '-' + pad(p.d) + 'T' + pad(p.h) + ':' + pad(p.mi) + ':00' +\n      (off >= 0 ? '+' : '-') + pad(Math.floor(a / 60)) + ':' + pad(a % 60);\n  }\n  function speakDay(ms, tz) {\n    return clean(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long', month: 'short', day: 'numeric' }).format(new Date(ms)));\n  }\n  function speakTime(ms, tz) {\n    return clean(new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).format(new Date(ms)));\n  }\n  function addDays(y, m, d, n) {\n    const t = new Date(Date.UTC(y, m - 1, d + n));\n    return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate() };\n  }\n  function hm(str, fallback) {\n    const m = /^(\\d{1,2}):?(\\d{2})?$/.exec(String(str || '').trim());\n    if (!m) return fallback;\n    return (+m[1]) * 60 + (+(m[2] || 0));\n  }\n\n  // Accepts \"2026-11-17\", \"2026-11-17 14:00\", \"2026-11-17T14:00\", or a full ISO with offset or Z.\n  function parseWhen(raw, tz) {\n    const s = String(raw == null ? '' : raw).trim();\n    if (!s) return null;\n    let m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(s);\n    if (m) return { dateOnly: true, y: +m[1], m: +m[2], d: +m[3], ms: localToMs(+m[1], +m[2], +m[3], 0, 0, tz) };\n    m = /^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{1,2}):(\\d{2})(?::\\d{2}(?:\\.\\d+)?)?$/.exec(s);\n    if (m) {\n      const ms = localToMs(+m[1], +m[2], +m[3], +m[4], +m[5], tz);\n      return { dateOnly: false, y: +m[1], m: +m[2], d: +m[3], ms };\n    }\n    if (/^\\d{4}-\\d{2}-\\d{2}T\\d{1,2}:\\d{2}.*(Z|[+-]\\d{2}:?\\d{2})$/i.test(s)) {\n      const ms = Date.parse(s);\n      if (isNaN(ms)) return null;\n      const p = partsInTz(ms, tz);\n      return { dateOnly: false, y: p.y, m: p.m, d: p.d, ms };\n    }\n    return null;\n  }\n\n  // ---------- settings ----------\n  function normSettings(s) {\n    s = s || {};\n    const days = String(s.open_days == null ? '1,2,3,4,5,6' : s.open_days)\n      .split(',').map(x => parseInt(x, 10)).filter(x => x >= 0 && x <= 6);\n    let brk = null;\n    const bm = /^(\\d{1,2}:\\d{2})\\s*-\\s*(\\d{1,2}:\\d{2})$/.exec(String(s.break_time || '').trim());\n    if (bm) brk = [hm(bm[1]), hm(bm[2])];\n    return {\n      business_name: String(s.business_name || 'the shop'),\n      timezone: String(s.timezone || 'America/New_York'),\n      open_days: days,\n      open_min: hm(s.open_time, 9 * 60),\n      close_min: hm(s.close_time, 17 * 60),\n      break_min: brk,\n      slot_minutes: Math.max(5, parseInt(s.slot_minutes, 10) || 60),\n      buffer_minutes: Math.max(0, parseInt(s.buffer_minutes, 10) || 0),\n      lead_minutes: Math.max(0, parseInt(s.lead_minutes == null ? 60 : s.lead_minutes, 10) || 0),\n      max_offer: Math.max(1, parseInt(s.max_offer, 10) || 3),\n      lookahead_days: Math.min(60, Math.max(1, parseInt(s.lookahead_days, 10) || 14)),\n      calendar_mode: String(s.calendar_mode || 'demo') === 'google' ? 'google' : 'demo',\n      google_calendar_id: String(s.google_calendar_id || 'primary'),\n    };\n  }\n\n  // ---------- request parsing ----------\n  function parseArgs(a) {\n    if (a == null) return {};\n    if (typeof a === 'string') { try { const o = JSON.parse(a); return (o && typeof o === 'object') ? o : {}; } catch (e) { return {}; } }\n    return typeof a === 'object' ? a : {};\n  }\n  function toolKind(name) {\n    const n = String(name || '').toLowerCase().replace(/[^a-z_]/g, '');\n    if (['check_availability', 'checkavailability', 'get_availability', 'get_open_slots', 'check_calendar', 'availability'].includes(n)) return 'check';\n    if (['book_appointment', 'bookappointment', 'book', 'create_booking', 'book_consultation', 'create_appointment'].includes(n)) return 'book';\n    if (n === 'reset_demo') return 'reset';\n    return 'unknown';\n  }\n  // Returns { source, calls: [{ toolCallId, name, kind, args, callId, phone }] }\n  function normalizeRequest(body) {\n    body = body || {};\n    const msg = body.message;\n    if (msg && typeof msg === 'object') {\n      const list = Array.isArray(msg.toolCallList) ? msg.toolCallList : (Array.isArray(msg.toolCalls) ? msg.toolCalls : []);\n      const call = msg.call || {};\n      const phone = (call.customer && call.customer.number) || (msg.customer && msg.customer.number) || '';\n      return {\n        source: 'vapi',\n        calls: list.map(tc => {\n          const fn = tc.function || {};\n          return { toolCallId: String(tc.id || ''), name: fn.name || tc.name || '', kind: toolKind(fn.name || tc.name), args: parseArgs(fn.arguments || tc.arguments), callId: String(call.id || ''), phone: String(phone || '') };\n        }),\n      };\n    }\n    if (body.name && body.args !== undefined) {\n      const call = body.call || {};\n      return { source: 'retell', calls: [{ toolCallId: '', name: body.name, kind: toolKind(body.name), args: parseArgs(body.args), callId: String(call.call_id || ''), phone: String(call.from_number || '') }] };\n    }\n    if (body.tool) {\n      return { source: 'simple', calls: [{ toolCallId: String(body.tool_call_id || 'test-1'), name: body.tool, kind: toolKind(body.tool), args: parseArgs(body.args), callId: String(body.call_id || ''), phone: String(body.caller_phone || '') }] };\n    }\n    return { source: 'unknown', calls: [] };\n  }\n\n  // ---------- calendar math ----------\n  function overlaps(a0, a1, b0, b1) { return a0 < b1 && b0 < a1; }\n  function busyMs(busy) {\n    return (busy || []).map(b => ({ s: Date.parse(b.start), e: Date.parse(b.end) })).filter(b => !isNaN(b.s) && !isNaN(b.e));\n  }\n  // Why a time is not bookable, or '' if it is.\n  function blockReason(startMs, S, busy, nowMs) {\n    const endMs = startMs + S.slot_minutes * 60000;\n    const p = partsInTz(startMs, S.timezone);\n    const startMin = p.h * 60 + p.mi;\n    const endMin = startMin + S.slot_minutes;\n    if (startMs < nowMs + S.lead_minutes * 60000) return 'too_soon';\n    if (!S.open_days.includes(p.wd)) return 'closed';\n    if (startMin < S.open_min || endMin > S.close_min) return 'closed';\n    if (S.break_min && overlaps(startMin, endMin, S.break_min[0], S.break_min[1])) return 'closed';\n    const buf = S.buffer_minutes * 60000;\n    for (const b of busyMs(busy)) if (overlaps(startMs - buf, endMs + buf, b.s, b.e)) return 'taken';\n    return '';\n  }\n  function slotsForDay(y, m, d, S, busy, nowMs) {\n    const out = [];\n    for (let t = S.open_min; t + S.slot_minutes <= S.close_min; t += S.slot_minutes) {\n      const ms = localToMs(y, m, d, Math.floor(t / 60), t % 60, S.timezone);\n      if (!blockReason(ms, S, busy, nowMs)) out.push(ms);\n    }\n    return out;\n  }\n  // Up to max open slots, starting on the given local day.\n  function findOpen(y, m, d, S, busy, nowMs, max) {\n    const out = [];\n    for (let i = 0; i < S.lookahead_days && out.length < max; i++) {\n      const day = addDays(y, m, d, i);\n      for (const ms of slotsForDay(day.y, day.m, day.d, S, busy, nowMs)) { if (out.length < max) out.push(ms); }\n    }\n    return out;\n  }\n  function listSlots(slots, S, knownDay) {\n    if (!slots.length) return '';\n    const tz = S.timezone;\n    let lastDay = knownDay || '';\n    const parts = slots.map(ms => {\n      const day = speakDay(ms, tz);\n      const txt = (day !== lastDay ? day + ' at ' : '') + speakTime(ms, tz) + ' (start ' + isoLocal(ms, tz) + ')';\n      lastDay = day;\n      return txt;\n    });\n    return parts.join('; ');\n  }\n\n  // Free/busy window to read before deciding. For a booking we read the booked day through the lookahead,\n  // so we can offer other times if the slot is gone.\n  function windowFor(call, S, nowMs) {\n    const tz = S.timezone;\n    const raw = call.kind === 'book' ? (call.args.start || call.args.datetime || call.args.start_time) : (call.args.date || call.args.day || call.args.start);\n    const w = parseWhen(raw, tz);\n    const base = w || (() => { const p = partsInTz(nowMs, tz); return { y: p.y, m: p.m, d: p.d }; })();\n    const end = addDays(base.y, base.m, base.d, S.lookahead_days + 1);\n    return { timeMin: new Date(localToMs(base.y, base.m, base.d, 0, 0, tz)).toISOString(), timeMax: new Date(localToMs(end.y, end.m, end.d, 0, 0, tz)).toISOString() };\n  }\n\n  function hash(str) {\n    let h = 2166136261;\n    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }\n    return (h >>> 0).toString(36).toUpperCase().slice(0, 6);\n  }\n  function bookingKey(call, startIso) {\n    const who = call.callId || call.phone || String(call.args.phone || '') || String(call.args.name || '') || 'anon';\n    return who + '|' + startIso;\n  }\n\n  // Decide what to do with one tool call. busy is [{start,end}] read fresh from the calendar.\n  // ledger is { key: { code, start, event_id } } of bookings this workflow already made.\n  function decide(call, S, busy, ledger, nowMs) {\n    const tz = S.timezone;\n    ledger = ledger || {};\n    if (call.kind === 'check') {\n      const raw = call.args.date || call.args.day || call.args.start;\n      let w = parseWhen(raw, tz);\n      if (raw && !w) return { action: 'error', text: 'I could not read that date. Send date as YYYY-MM-DD.' };\n      if (!w) { const p = partsInTz(nowMs, tz); w = { y: p.y, m: p.m, d: p.d }; }\n      const day = slotsForDay(w.y, w.m, w.d, S, busy, nowMs).slice(0, S.max_offer);\n      const label = speakDay(localToMs(w.y, w.m, w.d, 12, 0, tz), tz);\n      if (day.length) return { action: 'reply', slots: day.map(ms => isoLocal(ms, tz)), text: 'Open times on ' + label + ': ' + listSlots(day, S, label) + '. To book, pass the start value exactly. Times are ' + tz + '.' };\n      const next = findOpen(addDays(w.y, w.m, w.d, 1).y, addDays(w.y, w.m, w.d, 1).m, addDays(w.y, w.m, w.d, 1).d, S, busy, nowMs, S.max_offer);\n      if (next.length) return { action: 'reply', slots: next.map(ms => isoLocal(ms, tz)), text: 'No open times on ' + label + '. Next open: ' + listSlots(next, S) + '. Times are ' + tz + '.' };\n      return { action: 'reply', slots: [], text: 'No open times in the next ' + S.lookahead_days + ' days. Offer to take a message for the owner.' };\n    }\n    if (call.kind === 'book') {\n      const raw = call.args.start || call.args.datetime || call.args.start_time;\n      const w = parseWhen(raw, tz);\n      if (!w || w.dateOnly) return { action: 'error', text: 'I need the start time, like 2026-11-17T14:00. Check availability first and pass the start value exactly.' };\n      const startMs = w.ms;\n      const startIso = isoLocal(startMs, tz);\n      const endIso = isoLocal(startMs + S.slot_minutes * 60000, tz);\n      const key = bookingKey(call, startIso);\n      if (ledger[key]) {\n        return { action: 'duplicate', key, start: startIso, code: ledger[key].code, text: 'Already booked for ' + speakDay(startMs, tz) + ' at ' + speakTime(startMs, tz) + '. Confirmation ' + ledger[key].code + '. Do not book again.' };\n      }\n      const why = blockReason(startMs, S, busy, nowMs);\n      if (why) {\n        const p = partsInTz(startMs, tz);\n        const alt = findOpen(p.y, p.m, p.d, S, busy, nowMs, S.max_offer);\n        const lead = why === 'taken' ? 'That time is already taken.' : why === 'too_soon' ? 'That time is too soon or in the past.' : 'We are closed at that time.';\n        return { action: why, start: startIso, slots: alt.map(ms => isoLocal(ms, tz)), text: lead + (alt.length ? ' Open times: ' + listSlots(alt, S) + '.' : ' No open times soon. Offer to take a message.') + ' Nothing was booked.' };\n      }\n      const name = clean(call.args.name || call.args.customer_name || 'Caller').slice(0, 80);\n      const phone = clean(call.args.phone || call.phone || '').slice(0, 30);\n      const service = clean(call.args.service || 'Appointment').slice(0, 80);\n      const notes = clean(call.args.notes || '').slice(0, 300);\n      return {\n        action: 'create', key, start: startIso, end: endIso, code: 'NB-' + hash(key),\n        event: {\n          summary: service + ' - ' + name,\n          description: 'Booked by the AI phone agent. Phone: ' + (phone || 'not given') + (notes ? '. Notes: ' + notes : '') + '. Booking key: ' + key,\n          start: { dateTime: startIso, timeZone: tz },\n          end: { dateTime: endIso, timeZone: tz },\n          extendedProperties: { private: { nobsai_key: key } },\n        },\n      };\n    }\n    if (call.kind === 'reset') return { action: 'reset', text: 'Demo calendar cleared.' };\n    return { action: 'error', text: 'Unknown tool ' + clean(call.name) + '. Use check_availability or book_appointment.' };\n  }\n\n  // After we write, read the slot back. If two bookings landed at once, the earliest created wins.\n  // events: [{ id, created, status, key }] overlapping the slot. ours: { id, created, key }.\n  function verifyWinner(ours, events) {\n    const list = (events || []).filter(e => e && e.id && e.status !== 'cancelled');\n    if (!list.some(e => e.id === ours.id)) list.push(ours);\n    list.sort((a, b) => (Date.parse(a.created) - Date.parse(b.created)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));\n    const first = list[0];\n    if (first.id === ours.id) return { outcome: 'won' };\n    if (first.key && first.key === ours.key) return { outcome: 'duplicate', winner_id: first.id };\n    return { outcome: 'lost', winner_id: first.id };\n  }\n\n  function finalText(d, outcome, S) {\n    const tz = S.timezone;\n    const ms = Date.parse(d.start);\n    const when = speakDay(ms, tz) + ' at ' + speakTime(ms, tz);\n    if (outcome === 'won') return 'Booked for ' + when + '. Confirmation ' + d.code + '.';\n    if (outcome === 'duplicate') return 'Already booked for ' + when + '. Confirmation ' + d.code + '. Do not book again.';\n    return 'Sorry, ' + when + ' was just taken by another caller. Nothing was booked. Check availability again and offer another time.';\n  }\n\n  // Build the HTTP body the voice platform expects. Always sent with HTTP 200.\n  function buildResponse(source, results) {\n    const flat = s => clean(s).slice(0, 1000);\n    if (source === 'vapi') {\n      return { results: results.map(r => r.is_error ? { toolCallId: r.toolCallId, error: flat(r.text) } : { toolCallId: r.toolCallId, result: flat(r.text) }) };\n    }\n    if (source === 'retell') {\n      const r = results[0] || { text: 'No tool call found.', action: 'error' };\n      return { result: flat(r.text), action: r.action || '', start: r.start || '', code: r.code || '' };\n    }\n    if (source === 'simple') {\n      return { results: results.map(r => ({ toolCallId: r.toolCallId, action: r.action, result: flat(r.text), start: r.start || '', code: r.code || '', slots: r.slots || [] })) };\n    }\n    return { ok: true, note: 'No tool calls in this request.' };\n  }\n\n  return { partsInTz, tzOffsetMin, localToMs, isoLocal, speakDay, speakTime, parseWhen, normSettings, normalizeRequest, toolKind, blockReason, slotsForDay, findOpen, windowFor, decide, verifyWinner, finalText, buildResponse, bookingKey, hash };\n})();\n\n// One item per tool call. Vapi can send more than one tool call in a request.\nconst first = $input.first().json;\nconst S = NB.normSettings(first.settings);\nconst body = first.body || {};\nconst req = NB.normalizeRequest(body);\n// Test hook: a simple test body can pass \"now\" so you can test without waiting for a real date.\nlet nowMs = Date.now();\nif (req.source === 'simple' && body.now && !isNaN(Date.parse(body.now))) nowMs = Date.parse(body.now);\nif (!req.calls.length) {\n  return [{ json: { source: req.source, kind: 'none', settings: S, calendar_mode: S.calendar_mode, now_ms: nowMs, window: NB.windowFor({ kind: 'check', args: {} }, S, nowMs) } }];\n}\nreturn req.calls.map(c => ({ json: { ...c, source: req.source, settings: S, calendar_mode: S.calendar_mode, now_ms: nowMs, window: NB.windowFor(c, S, nowMs) } }));\n"
+      }
+    },
+    {
+      "id": "7ff0bc98-afeb-475b-9c83-94468f80b23c",
+      "name": "Loop Over Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "options": {}
+      }
+    },
+    {
+      "id": "0dd253a5-12ad-4bc8-a85d-3c268b9f38e9",
+      "name": "Google Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        880,
+        400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "7e133453-3529-4670-804e-35eaa8a73e21",
+              "leftValue": "={{ $json.calendar_mode === 'google' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b29e16bb-2b78-4fd7-b036-08c7bd02e594",
+      "name": "Google Free/Busy",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.googleapis.com/calendar/v3/freeBusy",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ timeMin: $json.window.timeMin, timeMax: $json.window.timeMax, timeZone: $json.settings.timezone, items: [{ id: $json.settings.google_calendar_id }] }) }}"
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "19cc8d46-0ba4-42e1-b0fa-0561228a9e0e",
+      "name": "Attach Busy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Google free/busy answer for this one tool call.\nconst base = $('Loop Over Items').item.json;\nconst r = $json || {};\nconst cal = r.calendars ? (r.calendars[base.settings.google_calendar_id] || Object.values(r.calendars)[0]) : null;\nif (!cal || (cal.errors && cal.errors.length)) {\n  const why = JSON.stringify(r.error || (cal && cal.errors) || 'no data').slice(0, 200);\n  return { json: { ...base, busy: [], calendar_error: 'Google free/busy failed: ' + why } };\n}\nreturn { json: { ...base, busy: cal.busy || [] } };\n",
+        "mode": "runOnceForEachItem"
+      }
+    },
+    {
+      "id": "96928fbc-64dc-4136-b2af-4420e4583b9e",
+      "name": "Demo Busy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        500
+      ],
+      "parameters": {
+        "jsCode": "// Practice calendar kept in this workflow's static data.\n// Static data only saves when the workflow is Active (published), not in a manual test run.\nconst st = $getWorkflowStaticData('global');\nst.demo_events = st.demo_events || [];\nst.ledger = st.ledger || {};\nconst base = $json;\nif (base.kind === 'reset') { st.demo_events = []; st.ledger = {}; st.demo_n = 0; }\nreturn { json: { ...base, busy: st.demo_events.map(e => ({ start: e.start, end: e.end })) } };\n",
+        "mode": "runOnceForEachItem"
+      }
+    },
+    {
+      "id": "34e5e04a-303d-4422-8db4-5122e20c7123",
+      "name": "Decide",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        400
+      ],
+      "parameters": {
+        "jsCode": "// No BS AI booking logic. Shared, dependency free.\n// The same text is pasted into the n8n Code nodes, run by test_logic.js in Node,\n// and run in the browser sandbox page. Edit here, then run build_workflow.py.\nconst NB = (function () {\n  const WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\n  function pad(n) { return String(n).padStart(2, '0'); }\n  function clean(s) { return String(s == null ? '' : s).replace(/[\\u202f\\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim(); }\n\n  // ---------- time zone helpers (Intl only, no libraries) ----------\n  function partsInTz(ms, tz) {\n    const f = new Intl.DateTimeFormat('en-US', {\n      timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',\n      hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'short',\n    });\n    const o = {};\n    for (const p of f.formatToParts(new Date(ms))) o[p.type] = p.value;\n    return { y: +o.year, m: +o.month, d: +o.day, h: (+o.hour) % 24, mi: +o.minute, s: +o.second, wd: WD.indexOf(o.weekday) };\n  }\n  function tzOffsetMin(ms, tz) {\n    const p = partsInTz(ms, tz);\n    const asUtc = Date.UTC(p.y, p.m - 1, p.d, p.h, p.mi, p.s);\n    return Math.round((asUtc - Math.floor(ms / 1000) * 1000) / 60000);\n  }\n  function localToMs(y, m, d, h, mi, tz) {\n    const guess = Date.UTC(y, m - 1, d, h, mi);\n    const off = tzOffsetMin(guess, tz);\n    let ms = guess - off * 60000;\n    const off2 = tzOffsetMin(ms, tz);\n    if (off2 !== off) ms = guess - off2 * 60000;\n    return ms;\n  }\n  function isoLocal(ms, tz) {\n    const p = partsInTz(ms, tz);\n    const off = tzOffsetMin(ms, tz);\n    const a = Math.abs(off);\n    return p.y + '-' + pad(p.m) + '-' + pad(p.d) + 'T' + pad(p.h) + ':' + pad(p.mi) + ':00' +\n      (off >= 0 ? '+' : '-') + pad(Math.floor(a / 60)) + ':' + pad(a % 60);\n  }\n  function speakDay(ms, tz) {\n    return clean(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long', month: 'short', day: 'numeric' }).format(new Date(ms)));\n  }\n  function speakTime(ms, tz) {\n    return clean(new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).format(new Date(ms)));\n  }\n  function addDays(y, m, d, n) {\n    const t = new Date(Date.UTC(y, m - 1, d + n));\n    return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate() };\n  }\n  function hm(str, fallback) {\n    const m = /^(\\d{1,2}):?(\\d{2})?$/.exec(String(str || '').trim());\n    if (!m) return fallback;\n    return (+m[1]) * 60 + (+(m[2] || 0));\n  }\n\n  // Accepts \"2026-11-17\", \"2026-11-17 14:00\", \"2026-11-17T14:00\", or a full ISO with offset or Z.\n  function parseWhen(raw, tz) {\n    const s = String(raw == null ? '' : raw).trim();\n    if (!s) return null;\n    let m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(s);\n    if (m) return { dateOnly: true, y: +m[1], m: +m[2], d: +m[3], ms: localToMs(+m[1], +m[2], +m[3], 0, 0, tz) };\n    m = /^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{1,2}):(\\d{2})(?::\\d{2}(?:\\.\\d+)?)?$/.exec(s);\n    if (m) {\n      const ms = localToMs(+m[1], +m[2], +m[3], +m[4], +m[5], tz);\n      return { dateOnly: false, y: +m[1], m: +m[2], d: +m[3], ms };\n    }\n    if (/^\\d{4}-\\d{2}-\\d{2}T\\d{1,2}:\\d{2}.*(Z|[+-]\\d{2}:?\\d{2})$/i.test(s)) {\n      const ms = Date.parse(s);\n      if (isNaN(ms)) return null;\n      const p = partsInTz(ms, tz);\n      return { dateOnly: false, y: p.y, m: p.m, d: p.d, ms };\n    }\n    return null;\n  }\n\n  // ---------- settings ----------\n  function normSettings(s) {\n    s = s || {};\n    const days = String(s.open_days == null ? '1,2,3,4,5,6' : s.open_days)\n      .split(',').map(x => parseInt(x, 10)).filter(x => x >= 0 && x <= 6);\n    let brk = null;\n    const bm = /^(\\d{1,2}:\\d{2})\\s*-\\s*(\\d{1,2}:\\d{2})$/.exec(String(s.break_time || '').trim());\n    if (bm) brk = [hm(bm[1]), hm(bm[2])];\n    return {\n      business_name: String(s.business_name || 'the shop'),\n      timezone: String(s.timezone || 'America/New_York'),\n      open_days: days,\n      open_min: hm(s.open_time, 9 * 60),\n      close_min: hm(s.close_time, 17 * 60),\n      break_min: brk,\n      slot_minutes: Math.max(5, parseInt(s.slot_minutes, 10) || 60),\n      buffer_minutes: Math.max(0, parseInt(s.buffer_minutes, 10) || 0),\n      lead_minutes: Math.max(0, parseInt(s.lead_minutes == null ? 60 : s.lead_minutes, 10) || 0),\n      max_offer: Math.max(1, parseInt(s.max_offer, 10) || 3),\n      lookahead_days: Math.min(60, Math.max(1, parseInt(s.lookahead_days, 10) || 14)),\n      calendar_mode: String(s.calendar_mode || 'demo') === 'google' ? 'google' : 'demo',\n      google_calendar_id: String(s.google_calendar_id || 'primary'),\n    };\n  }\n\n  // ---------- request parsing ----------\n  function parseArgs(a) {\n    if (a == null) return {};\n    if (typeof a === 'string') { try { const o = JSON.parse(a); return (o && typeof o === 'object') ? o : {}; } catch (e) { return {}; } }\n    return typeof a === 'object' ? a : {};\n  }\n  function toolKind(name) {\n    const n = String(name || '').toLowerCase().replace(/[^a-z_]/g, '');\n    if (['check_availability', 'checkavailability', 'get_availability', 'get_open_slots', 'check_calendar', 'availability'].includes(n)) return 'check';\n    if (['book_appointment', 'bookappointment', 'book', 'create_booking', 'book_consultation', 'create_appointment'].includes(n)) return 'book';\n    if (n === 'reset_demo') return 'reset';\n    return 'unknown';\n  }\n  // Returns { source, calls: [{ toolCallId, name, kind, args, callId, phone }] }\n  function normalizeRequest(body) {\n    body = body || {};\n    const msg = body.message;\n    if (msg && typeof msg === 'object') {\n      const list = Array.isArray(msg.toolCallList) ? msg.toolCallList : (Array.isArray(msg.toolCalls) ? msg.toolCalls : []);\n      const call = msg.call || {};\n      const phone = (call.customer && call.customer.number) || (msg.customer && msg.customer.number) || '';\n      return {\n        source: 'vapi',\n        calls: list.map(tc => {\n          const fn = tc.function || {};\n          return { toolCallId: String(tc.id || ''), name: fn.name || tc.name || '', kind: toolKind(fn.name || tc.name), args: parseArgs(fn.arguments || tc.arguments), callId: String(call.id || ''), phone: String(phone || '') };\n        }),\n      };\n    }\n    if (body.name && body.args !== undefined) {\n      const call = body.call || {};\n      return { source: 'retell', calls: [{ toolCallId: '', name: body.name, kind: toolKind(body.name), args: parseArgs(body.args), callId: String(call.call_id || ''), phone: String(call.from_number || '') }] };\n    }\n    if (body.tool) {\n      return { source: 'simple', calls: [{ toolCallId: String(body.tool_call_id || 'test-1'), name: body.tool, kind: toolKind(body.tool), args: parseArgs(body.args), callId: String(body.call_id || ''), phone: String(body.caller_phone || '') }] };\n    }\n    return { source: 'unknown', calls: [] };\n  }\n\n  // ---------- calendar math ----------\n  function overlaps(a0, a1, b0, b1) { return a0 < b1 && b0 < a1; }\n  function busyMs(busy) {\n    return (busy || []).map(b => ({ s: Date.parse(b.start), e: Date.parse(b.end) })).filter(b => !isNaN(b.s) && !isNaN(b.e));\n  }\n  // Why a time is not bookable, or '' if it is.\n  function blockReason(startMs, S, busy, nowMs) {\n    const endMs = startMs + S.slot_minutes * 60000;\n    const p = partsInTz(startMs, S.timezone);\n    const startMin = p.h * 60 + p.mi;\n    const endMin = startMin + S.slot_minutes;\n    if (startMs < nowMs + S.lead_minutes * 60000) return 'too_soon';\n    if (!S.open_days.includes(p.wd)) return 'closed';\n    if (startMin < S.open_min || endMin > S.close_min) return 'closed';\n    if (S.break_min && overlaps(startMin, endMin, S.break_min[0], S.break_min[1])) return 'closed';\n    const buf = S.buffer_minutes * 60000;\n    for (const b of busyMs(busy)) if (overlaps(startMs - buf, endMs + buf, b.s, b.e)) return 'taken';\n    return '';\n  }\n  function slotsForDay(y, m, d, S, busy, nowMs) {\n    const out = [];\n    for (let t = S.open_min; t + S.slot_minutes <= S.close_min; t += S.slot_minutes) {\n      const ms = localToMs(y, m, d, Math.floor(t / 60), t % 60, S.timezone);\n      if (!blockReason(ms, S, busy, nowMs)) out.push(ms);\n    }\n    return out;\n  }\n  // Up to max open slots, starting on the given local day.\n  function findOpen(y, m, d, S, busy, nowMs, max) {\n    const out = [];\n    for (let i = 0; i < S.lookahead_days && out.length < max; i++) {\n      const day = addDays(y, m, d, i);\n      for (const ms of slotsForDay(day.y, day.m, day.d, S, busy, nowMs)) { if (out.length < max) out.push(ms); }\n    }\n    return out;\n  }\n  function listSlots(slots, S, knownDay) {\n    if (!slots.length) return '';\n    const tz = S.timezone;\n    let lastDay = knownDay || '';\n    const parts = slots.map(ms => {\n      const day = speakDay(ms, tz);\n      const txt = (day !== lastDay ? day + ' at ' : '') + speakTime(ms, tz) + ' (start ' + isoLocal(ms, tz) + ')';\n      lastDay = day;\n      return txt;\n    });\n    return parts.join('; ');\n  }\n\n  // Free/busy window to read before deciding. For a booking we read the booked day through the lookahead,\n  // so we can offer other times if the slot is gone.\n  function windowFor(call, S, nowMs) {\n    const tz = S.timezone;\n    const raw = call.kind === 'book' ? (call.args.start || call.args.datetime || call.args.start_time) : (call.args.date || call.args.day || call.args.start);\n    const w = parseWhen(raw, tz);\n    const base = w || (() => { const p = partsInTz(nowMs, tz); return { y: p.y, m: p.m, d: p.d }; })();\n    const end = addDays(base.y, base.m, base.d, S.lookahead_days + 1);\n    return { timeMin: new Date(localToMs(base.y, base.m, base.d, 0, 0, tz)).toISOString(), timeMax: new Date(localToMs(end.y, end.m, end.d, 0, 0, tz)).toISOString() };\n  }\n\n  function hash(str) {\n    let h = 2166136261;\n    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }\n    return (h >>> 0).toString(36).toUpperCase().slice(0, 6);\n  }\n  function bookingKey(call, startIso) {\n    const who = call.callId || call.phone || String(call.args.phone || '') || String(call.args.name || '') || 'anon';\n    return who + '|' + startIso;\n  }\n\n  // Decide what to do with one tool call. busy is [{start,end}] read fresh from the calendar.\n  // ledger is { key: { code, start, event_id } } of bookings this workflow already made.\n  function decide(call, S, busy, ledger, nowMs) {\n    const tz = S.timezone;\n    ledger = ledger || {};\n    if (call.kind === 'check') {\n      const raw = call.args.date || call.args.day || call.args.start;\n      let w = parseWhen(raw, tz);\n      if (raw && !w) return { action: 'error', text: 'I could not read that date. Send date as YYYY-MM-DD.' };\n      if (!w) { const p = partsInTz(nowMs, tz); w = { y: p.y, m: p.m, d: p.d }; }\n      const day = slotsForDay(w.y, w.m, w.d, S, busy, nowMs).slice(0, S.max_offer);\n      const label = speakDay(localToMs(w.y, w.m, w.d, 12, 0, tz), tz);\n      if (day.length) return { action: 'reply', slots: day.map(ms => isoLocal(ms, tz)), text: 'Open times on ' + label + ': ' + listSlots(day, S, label) + '. To book, pass the start value exactly. Times are ' + tz + '.' };\n      const next = findOpen(addDays(w.y, w.m, w.d, 1).y, addDays(w.y, w.m, w.d, 1).m, addDays(w.y, w.m, w.d, 1).d, S, busy, nowMs, S.max_offer);\n      if (next.length) return { action: 'reply', slots: next.map(ms => isoLocal(ms, tz)), text: 'No open times on ' + label + '. Next open: ' + listSlots(next, S) + '. Times are ' + tz + '.' };\n      return { action: 'reply', slots: [], text: 'No open times in the next ' + S.lookahead_days + ' days. Offer to take a message for the owner.' };\n    }\n    if (call.kind === 'book') {\n      const raw = call.args.start || call.args.datetime || call.args.start_time;\n      const w = parseWhen(raw, tz);\n      if (!w || w.dateOnly) return { action: 'error', text: 'I need the start time, like 2026-11-17T14:00. Check availability first and pass the start value exactly.' };\n      const startMs = w.ms;\n      const startIso = isoLocal(startMs, tz);\n      const endIso = isoLocal(startMs + S.slot_minutes * 60000, tz);\n      const key = bookingKey(call, startIso);\n      if (ledger[key]) {\n        return { action: 'duplicate', key, start: startIso, code: ledger[key].code, text: 'Already booked for ' + speakDay(startMs, tz) + ' at ' + speakTime(startMs, tz) + '. Confirmation ' + ledger[key].code + '. Do not book again.' };\n      }\n      const why = blockReason(startMs, S, busy, nowMs);\n      if (why) {\n        const p = partsInTz(startMs, tz);\n        const alt = findOpen(p.y, p.m, p.d, S, busy, nowMs, S.max_offer);\n        const lead = why === 'taken' ? 'That time is already taken.' : why === 'too_soon' ? 'That time is too soon or in the past.' : 'We are closed at that time.';\n        return { action: why, start: startIso, slots: alt.map(ms => isoLocal(ms, tz)), text: lead + (alt.length ? ' Open times: ' + listSlots(alt, S) + '.' : ' No open times soon. Offer to take a message.') + ' Nothing was booked.' };\n      }\n      const name = clean(call.args.name || call.args.customer_name || 'Caller').slice(0, 80);\n      const phone = clean(call.args.phone || call.phone || '').slice(0, 30);\n      const service = clean(call.args.service || 'Appointment').slice(0, 80);\n      const notes = clean(call.args.notes || '').slice(0, 300);\n      return {\n        action: 'create', key, start: startIso, end: endIso, code: 'NB-' + hash(key),\n        event: {\n          summary: service + ' - ' + name,\n          description: 'Booked by the AI phone agent. Phone: ' + (phone || 'not given') + (notes ? '. Notes: ' + notes : '') + '. Booking key: ' + key,\n          start: { dateTime: startIso, timeZone: tz },\n          end: { dateTime: endIso, timeZone: tz },\n          extendedProperties: { private: { nobsai_key: key } },\n        },\n      };\n    }\n    if (call.kind === 'reset') return { action: 'reset', text: 'Demo calendar cleared.' };\n    return { action: 'error', text: 'Unknown tool ' + clean(call.name) + '. Use check_availability or book_appointment.' };\n  }\n\n  // After we write, read the slot back. If two bookings landed at once, the earliest created wins.\n  // events: [{ id, created, status, key }] overlapping the slot. ours: { id, created, key }.\n  function verifyWinner(ours, events) {\n    const list = (events || []).filter(e => e && e.id && e.status !== 'cancelled');\n    if (!list.some(e => e.id === ours.id)) list.push(ours);\n    list.sort((a, b) => (Date.parse(a.created) - Date.parse(b.created)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));\n    const first = list[0];\n    if (first.id === ours.id) return { outcome: 'won' };\n    if (first.key && first.key === ours.key) return { outcome: 'duplicate', winner_id: first.id };\n    return { outcome: 'lost', winner_id: first.id };\n  }\n\n  function finalText(d, outcome, S) {\n    const tz = S.timezone;\n    const ms = Date.parse(d.start);\n    const when = speakDay(ms, tz) + ' at ' + speakTime(ms, tz);\n    if (outcome === 'won') return 'Booked for ' + when + '. Confirmation ' + d.code + '.';\n    if (outcome === 'duplicate') return 'Already booked for ' + when + '. Confirmation ' + d.code + '. Do not book again.';\n    return 'Sorry, ' + when + ' was just taken by another caller. Nothing was booked. Check availability again and offer another time.';\n  }\n\n  // Build the HTTP body the voice platform expects. Always sent with HTTP 200.\n  function buildResponse(source, results) {\n    const flat = s => clean(s).slice(0, 1000);\n    if (source === 'vapi') {\n      return { results: results.map(r => r.is_error ? { toolCallId: r.toolCallId, error: flat(r.text) } : { toolCallId: r.toolCallId, result: flat(r.text) }) };\n    }\n    if (source === 'retell') {\n      const r = results[0] || { text: 'No tool call found.', action: 'error' };\n      return { result: flat(r.text), action: r.action || '', start: r.start || '', code: r.code || '' };\n    }\n    if (source === 'simple') {\n      return { results: results.map(r => ({ toolCallId: r.toolCallId, action: r.action, result: flat(r.text), start: r.start || '', code: r.code || '', slots: r.slots || [] })) };\n    }\n    return { ok: true, note: 'No tool calls in this request.' };\n  }\n\n  return { partsInTz, tzOffsetMin, localToMs, isoLocal, speakDay, speakTime, parseWhen, normSettings, normalizeRequest, toolKind, blockReason, slotsForDay, findOpen, windowFor, decide, verifyWinner, finalText, buildResponse, bookingKey, hash };\n})();\n\n// Check the fresh free/busy right before any write. Never book on a stale answer.\nconst it = $json;\nconst S = it.settings;\nif (it.kind === 'none') return { json: { ...it, busy: undefined, action: 'none', text: '' } };\nif (it.calendar_error) {\n  return { json: { ...it, busy: undefined, action: 'error', is_error: true, text: 'The calendar is not reachable right now. Nothing was booked. Take a message and tell the caller the owner will call back.' } };\n}\nconst st = $getWorkflowStaticData('global');\nconst d = NB.decide(it, S, it.busy, st.ledger || {}, it.now_ms);\nreturn { json: { ...it, busy: undefined, ...d, is_error: d.action === 'error' } };\n",
+        "mode": "runOnceForEachItem"
+      }
+    },
+    {
+      "id": "ce69f335-9f18-42a6-8958-3aae6a137df2",
+      "name": "Needs Write?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "bc55d2d5-93c6-4279-af03-a0c51c11a9cc",
+              "leftValue": "={{ $json.action === 'create' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "46e3db41-1d6f-475b-b704-6413ca6e3a57",
+      "name": "Google Write?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c0f373cc-91b1-4a1d-8d91-378dbf45bce4",
+              "leftValue": "={{ $json.calendar_mode === 'google' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b8c2f498-9d51-4df5-a5f6-fbe6ab6d70f0",
+      "name": "Create Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2200,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($json.settings.google_calendar_id) }}/events",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.event) }}"
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "5cc60846-3d94-4831-97cf-2b3fb896c0cc",
+      "name": "Read Slot Back",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2420,
+        200
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($('Decide').item.json.settings.google_calendar_id) }}/events",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {},
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "timeMin",
+              "value": "={{ $('Decide').item.json.start }}"
+            },
+            {
+              "name": "timeMax",
+              "value": "={{ $('Decide').item.json.end }}"
+            },
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "showDeleted",
+              "value": "false"
+            },
+            {
+              "name": "maxResults",
+              "value": "50"
+            }
+          ]
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "e0450315-843f-48ee-8f82-3706f5445992",
+      "name": "Verify Winner",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// No BS AI booking logic. Shared, dependency free.\n// The same text is pasted into the n8n Code nodes, run by test_logic.js in Node,\n// and run in the browser sandbox page. Edit here, then run build_workflow.py.\nconst NB = (function () {\n  const WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\n  function pad(n) { return String(n).padStart(2, '0'); }\n  function clean(s) { return String(s == null ? '' : s).replace(/[\\u202f\\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim(); }\n\n  // ---------- time zone helpers (Intl only, no libraries) ----------\n  function partsInTz(ms, tz) {\n    const f = new Intl.DateTimeFormat('en-US', {\n      timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',\n      hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'short',\n    });\n    const o = {};\n    for (const p of f.formatToParts(new Date(ms))) o[p.type] = p.value;\n    return { y: +o.year, m: +o.month, d: +o.day, h: (+o.hour) % 24, mi: +o.minute, s: +o.second, wd: WD.indexOf(o.weekday) };\n  }\n  function tzOffsetMin(ms, tz) {\n    const p = partsInTz(ms, tz);\n    const asUtc = Date.UTC(p.y, p.m - 1, p.d, p.h, p.mi, p.s);\n    return Math.round((asUtc - Math.floor(ms / 1000) * 1000) / 60000);\n  }\n  function localToMs(y, m, d, h, mi, tz) {\n    const guess = Date.UTC(y, m - 1, d, h, mi);\n    const off = tzOffsetMin(guess, tz);\n    let ms = guess - off * 60000;\n    const off2 = tzOffsetMin(ms, tz);\n    if (off2 !== off) ms = guess - off2 * 60000;\n    return ms;\n  }\n  function isoLocal(ms, tz) {\n    const p = partsInTz(ms, tz);\n    const off = tzOffsetMin(ms, tz);\n    const a = Math.abs(off);\n    return p.y + '-' + pad(p.m) + '-' + pad(p.d) + 'T' + pad(p.h) + ':' + pad(p.mi) + ':00' +\n      (off >= 0 ? '+' : '-') + pad(Math.floor(a / 60)) + ':' + pad(a % 60);\n  }\n  function speakDay(ms, tz) {\n    return clean(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long', month: 'short', day: 'numeric' }).format(new Date(ms)));\n  }\n  function speakTime(ms, tz) {\n    return clean(new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).format(new Date(ms)));\n  }\n  function addDays(y, m, d, n) {\n    const t = new Date(Date.UTC(y, m - 1, d + n));\n    return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate() };\n  }\n  function hm(str, fallback) {\n    const m = /^(\\d{1,2}):?(\\d{2})?$/.exec(String(str || '').trim());\n    if (!m) return fallback;\n    return (+m[1]) * 60 + (+(m[2] || 0));\n  }\n\n  // Accepts \"2026-11-17\", \"2026-11-17 14:00\", \"2026-11-17T14:00\", or a full ISO with offset or Z.\n  function parseWhen(raw, tz) {\n    const s = String(raw == null ? '' : raw).trim();\n    if (!s) return null;\n    let m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(s);\n    if (m) return { dateOnly: true, y: +m[1], m: +m[2], d: +m[3], ms: localToMs(+m[1], +m[2], +m[3], 0, 0, tz) };\n    m = /^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{1,2}):(\\d{2})(?::\\d{2}(?:\\.\\d+)?)?$/.exec(s);\n    if (m) {\n      const ms = localToMs(+m[1], +m[2], +m[3], +m[4], +m[5], tz);\n      return { dateOnly: false, y: +m[1], m: +m[2], d: +m[3], ms };\n    }\n    if (/^\\d{4}-\\d{2}-\\d{2}T\\d{1,2}:\\d{2}.*(Z|[+-]\\d{2}:?\\d{2})$/i.test(s)) {\n      const ms = Date.parse(s);\n      if (isNaN(ms)) return null;\n      const p = partsInTz(ms, tz);\n      return { dateOnly: false, y: p.y, m: p.m, d: p.d, ms };\n    }\n    return null;\n  }\n\n  // ---------- settings ----------\n  function normSettings(s) {\n    s = s || {};\n    const days = String(s.open_days == null ? '1,2,3,4,5,6' : s.open_days)\n      .split(',').map(x => parseInt(x, 10)).filter(x => x >= 0 && x <= 6);\n    let brk = null;\n    const bm = /^(\\d{1,2}:\\d{2})\\s*-\\s*(\\d{1,2}:\\d{2})$/.exec(String(s.break_time || '').trim());\n    if (bm) brk = [hm(bm[1]), hm(bm[2])];\n    return {\n      business_name: String(s.business_name || 'the shop'),\n      timezone: String(s.timezone || 'America/New_York'),\n      open_days: days,\n      open_min: hm(s.open_time, 9 * 60),\n      close_min: hm(s.close_time, 17 * 60),\n      break_min: brk,\n      slot_minutes: Math.max(5, parseInt(s.slot_minutes, 10) || 60),\n      buffer_minutes: Math.max(0, parseInt(s.buffer_minutes, 10) || 0),\n      lead_minutes: Math.max(0, parseInt(s.lead_minutes == null ? 60 : s.lead_minutes, 10) || 0),\n      max_offer: Math.max(1, parseInt(s.max_offer, 10) || 3),\n      lookahead_days: Math.min(60, Math.max(1, parseInt(s.lookahead_days, 10) || 14)),\n      calendar_mode: String(s.calendar_mode || 'demo') === 'google' ? 'google' : 'demo',\n      google_calendar_id: String(s.google_calendar_id || 'primary'),\n    };\n  }\n\n  // ---------- request parsing ----------\n  function parseArgs(a) {\n    if (a == null) return {};\n    if (typeof a === 'string') { try { const o = JSON.parse(a); return (o && typeof o === 'object') ? o : {}; } catch (e) { return {}; } }\n    return typeof a === 'object' ? a : {};\n  }\n  function toolKind(name) {\n    const n = String(name || '').toLowerCase().replace(/[^a-z_]/g, '');\n    if (['check_availability', 'checkavailability', 'get_availability', 'get_open_slots', 'check_calendar', 'availability'].includes(n)) return 'check';\n    if (['book_appointment', 'bookappointment', 'book', 'create_booking', 'book_consultation', 'create_appointment'].includes(n)) return 'book';\n    if (n === 'reset_demo') return 'reset';\n    return 'unknown';\n  }\n  // Returns { source, calls: [{ toolCallId, name, kind, args, callId, phone }] }\n  function normalizeRequest(body) {\n    body = body || {};\n    const msg = body.message;\n    if (msg && typeof msg === 'object') {\n      const list = Array.isArray(msg.toolCallList) ? msg.toolCallList : (Array.isArray(msg.toolCalls) ? msg.toolCalls : []);\n      const call = msg.call || {};\n      const phone = (call.customer && call.customer.number) || (msg.customer && msg.customer.number) || '';\n      return {\n        source: 'vapi',\n        calls: list.map(tc => {\n          const fn = tc.function || {};\n          return { toolCallId: String(tc.id || ''), name: fn.name || tc.name || '', kind: toolKind(fn.name || tc.name), args: parseArgs(fn.arguments || tc.arguments), callId: String(call.id || ''), phone: String(phone || '') };\n        }),\n      };\n    }\n    if (body.name && body.args !== undefined) {\n      const call = body.call || {};\n      return { source: 'retell', calls: [{ toolCallId: '', name: body.name, kind: toolKind(body.name), args: parseArgs(body.args), callId: String(call.call_id || ''), phone: String(call.from_number || '') }] };\n    }\n    if (body.tool) {\n      return { source: 'simple', calls: [{ toolCallId: String(body.tool_call_id || 'test-1'), name: body.tool, kind: toolKind(body.tool), args: parseArgs(body.args), callId: String(body.call_id || ''), phone: String(body.caller_phone || '') }] };\n    }\n    return { source: 'unknown', calls: [] };\n  }\n\n  // ---------- calendar math ----------\n  function overlaps(a0, a1, b0, b1) { return a0 < b1 && b0 < a1; }\n  function busyMs(busy) {\n    return (busy || []).map(b => ({ s: Date.parse(b.start), e: Date.parse(b.end) })).filter(b => !isNaN(b.s) && !isNaN(b.e));\n  }\n  // Why a time is not bookable, or '' if it is.\n  function blockReason(startMs, S, busy, nowMs) {\n    const endMs = startMs + S.slot_minutes * 60000;\n    const p = partsInTz(startMs, S.timezone);\n    const startMin = p.h * 60 + p.mi;\n    const endMin = startMin + S.slot_minutes;\n    if (startMs < nowMs + S.lead_minutes * 60000) return 'too_soon';\n    if (!S.open_days.includes(p.wd)) return 'closed';\n    if (startMin < S.open_min || endMin > S.close_min) return 'closed';\n    if (S.break_min && overlaps(startMin, endMin, S.break_min[0], S.break_min[1])) return 'closed';\n    const buf = S.buffer_minutes * 60000;\n    for (const b of busyMs(busy)) if (overlaps(startMs - buf, endMs + buf, b.s, b.e)) return 'taken';\n    return '';\n  }\n  function slotsForDay(y, m, d, S, busy, nowMs) {\n    const out = [];\n    for (let t = S.open_min; t + S.slot_minutes <= S.close_min; t += S.slot_minutes) {\n      const ms = localToMs(y, m, d, Math.floor(t / 60), t % 60, S.timezone);\n      if (!blockReason(ms, S, busy, nowMs)) out.push(ms);\n    }\n    return out;\n  }\n  // Up to max open slots, starting on the given local day.\n  function findOpen(y, m, d, S, busy, nowMs, max) {\n    const out = [];\n    for (let i = 0; i < S.lookahead_days && out.length < max; i++) {\n      const day = addDays(y, m, d, i);\n      for (const ms of slotsForDay(day.y, day.m, day.d, S, busy, nowMs)) { if (out.length < max) out.push(ms); }\n    }\n    return out;\n  }\n  function listSlots(slots, S, knownDay) {\n    if (!slots.length) return '';\n    const tz = S.timezone;\n    let lastDay = knownDay || '';\n    const parts = slots.map(ms => {\n      const day = speakDay(ms, tz);\n      const txt = (day !== lastDay ? day + ' at ' : '') + speakTime(ms, tz) + ' (start ' + isoLocal(ms, tz) + ')';\n      lastDay = day;\n      return txt;\n    });\n    return parts.join('; ');\n  }\n\n  // Free/busy window to read before deciding. For a booking we read the booked day through the lookahead,\n  // so we can offer other times if the slot is gone.\n  function windowFor(call, S, nowMs) {\n    const tz = S.timezone;\n    const raw = call.kind === 'book' ? (call.args.start || call.args.datetime || call.args.start_time) : (call.args.date || call.args.day || call.args.start);\n    const w = parseWhen(raw, tz);\n    const base = w || (() => { const p = partsInTz(nowMs, tz); return { y: p.y, m: p.m, d: p.d }; })();\n    const end = addDays(base.y, base.m, base.d, S.lookahead_days + 1);\n    return { timeMin: new Date(localToMs(base.y, base.m, base.d, 0, 0, tz)).toISOString(), timeMax: new Date(localToMs(end.y, end.m, end.d, 0, 0, tz)).toISOString() };\n  }\n\n  function hash(str) {\n    let h = 2166136261;\n    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }\n    return (h >>> 0).toString(36).toUpperCase().slice(0, 6);\n  }\n  function bookingKey(call, startIso) {\n    const who = call.callId || call.phone || String(call.args.phone || '') || String(call.args.name || '') || 'anon';\n    return who + '|' + startIso;\n  }\n\n  // Decide what to do with one tool call. busy is [{start,end}] read fresh from the calendar.\n  // ledger is { key: { code, start, event_id } } of bookings this workflow already made.\n  function decide(call, S, busy, ledger, nowMs) {\n    const tz = S.timezone;\n    ledger = ledger || {};\n    if (call.kind === 'check') {\n      const raw = call.args.date || call.args.day || call.args.start;\n      let w = parseWhen(raw, tz);\n      if (raw && !w) return { action: 'error', text: 'I could not read that date. Send date as YYYY-MM-DD.' };\n      if (!w) { const p = partsInTz(nowMs, tz); w = { y: p.y, m: p.m, d: p.d }; }\n      const day = slotsForDay(w.y, w.m, w.d, S, busy, nowMs).slice(0, S.max_offer);\n      const label = speakDay(localToMs(w.y, w.m, w.d, 12, 0, tz), tz);\n      if (day.length) return { action: 'reply', slots: day.map(ms => isoLocal(ms, tz)), text: 'Open times on ' + label + ': ' + listSlots(day, S, label) + '. To book, pass the start value exactly. Times are ' + tz + '.' };\n      const next = findOpen(addDays(w.y, w.m, w.d, 1).y, addDays(w.y, w.m, w.d, 1).m, addDays(w.y, w.m, w.d, 1).d, S, busy, nowMs, S.max_offer);\n      if (next.length) return { action: 'reply', slots: next.map(ms => isoLocal(ms, tz)), text: 'No open times on ' + label + '. Next open: ' + listSlots(next, S) + '. Times are ' + tz + '.' };\n      return { action: 'reply', slots: [], text: 'No open times in the next ' + S.lookahead_days + ' days. Offer to take a message for the owner.' };\n    }\n    if (call.kind === 'book') {\n      const raw = call.args.start || call.args.datetime || call.args.start_time;\n      const w = parseWhen(raw, tz);\n      if (!w || w.dateOnly) return { action: 'error', text: 'I need the start time, like 2026-11-17T14:00. Check availability first and pass the start value exactly.' };\n      const startMs = w.ms;\n      const startIso = isoLocal(startMs, tz);\n      const endIso = isoLocal(startMs + S.slot_minutes * 60000, tz);\n      const key = bookingKey(call, startIso);\n      if (ledger[key]) {\n        return { action: 'duplicate', key, start: startIso, code: ledger[key].code, text: 'Already booked for ' + speakDay(startMs, tz) + ' at ' + speakTime(startMs, tz) + '. Confirmation ' + ledger[key].code + '. Do not book again.' };\n      }\n      const why = blockReason(startMs, S, busy, nowMs);\n      if (why) {\n        const p = partsInTz(startMs, tz);\n        const alt = findOpen(p.y, p.m, p.d, S, busy, nowMs, S.max_offer);\n        const lead = why === 'taken' ? 'That time is already taken.' : why === 'too_soon' ? 'That time is too soon or in the past.' : 'We are closed at that time.';\n        return { action: why, start: startIso, slots: alt.map(ms => isoLocal(ms, tz)), text: lead + (alt.length ? ' Open times: ' + listSlots(alt, S) + '.' : ' No open times soon. Offer to take a message.') + ' Nothing was booked.' };\n      }\n      const name = clean(call.args.name || call.args.customer_name || 'Caller').slice(0, 80);\n      const phone = clean(call.args.phone || call.phone || '').slice(0, 30);\n      const service = clean(call.args.service || 'Appointment').slice(0, 80);\n      const notes = clean(call.args.notes || '').slice(0, 300);\n      return {\n        action: 'create', key, start: startIso, end: endIso, code: 'NB-' + hash(key),\n        event: {\n          summary: service + ' - ' + name,\n          description: 'Booked by the AI phone agent. Phone: ' + (phone || 'not given') + (notes ? '. Notes: ' + notes : '') + '. Booking key: ' + key,\n          start: { dateTime: startIso, timeZone: tz },\n          end: { dateTime: endIso, timeZone: tz },\n          extendedProperties: { private: { nobsai_key: key } },\n        },\n      };\n    }\n    if (call.kind === 'reset') return { action: 'reset', text: 'Demo calendar cleared.' };\n    return { action: 'error', text: 'Unknown tool ' + clean(call.name) + '. Use check_availability or book_appointment.' };\n  }\n\n  // After we write, read the slot back. If two bookings landed at once, the earliest created wins.\n  // events: [{ id, created, status, key }] overlapping the slot. ours: { id, created, key }.\n  function verifyWinner(ours, events) {\n    const list = (events || []).filter(e => e && e.id && e.status !== 'cancelled');\n    if (!list.some(e => e.id === ours.id)) list.push(ours);\n    list.sort((a, b) => (Date.parse(a.created) - Date.parse(b.created)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));\n    const first = list[0];\n    if (first.id === ours.id) return { outcome: 'won' };\n    if (first.key && first.key === ours.key) return { outcome: 'duplicate', winner_id: first.id };\n    return { outcome: 'lost', winner_id: first.id };\n  }\n\n  function finalText(d, outcome, S) {\n    const tz = S.timezone;\n    const ms = Date.parse(d.start);\n    const when = speakDay(ms, tz) + ' at ' + speakTime(ms, tz);\n    if (outcome === 'won') return 'Booked for ' + when + '. Confirmation ' + d.code + '.';\n    if (outcome === 'duplicate') return 'Already booked for ' + when + '. Confirmation ' + d.code + '. Do not book again.';\n    return 'Sorry, ' + when + ' was just taken by another caller. Nothing was booked. Check availability again and offer another time.';\n  }\n\n  // Build the HTTP body the voice platform expects. Always sent with HTTP 200.\n  function buildResponse(source, results) {\n    const flat = s => clean(s).slice(0, 1000);\n    if (source === 'vapi') {\n      return { results: results.map(r => r.is_error ? { toolCallId: r.toolCallId, error: flat(r.text) } : { toolCallId: r.toolCallId, result: flat(r.text) }) };\n    }\n    if (source === 'retell') {\n      const r = results[0] || { text: 'No tool call found.', action: 'error' };\n      return { result: flat(r.text), action: r.action || '', start: r.start || '', code: r.code || '' };\n    }\n    if (source === 'simple') {\n      return { results: results.map(r => ({ toolCallId: r.toolCallId, action: r.action, result: flat(r.text), start: r.start || '', code: r.code || '', slots: r.slots || [] })) };\n    }\n    return { ok: true, note: 'No tool calls in this request.' };\n  }\n\n  return { partsInTz, tzOffsetMin, localToMs, isoLocal, speakDay, speakTime, parseWhen, normSettings, normalizeRequest, toolKind, blockReason, slotsForDay, findOpen, windowFor, decide, verifyWinner, finalText, buildResponse, bookingKey, hash };\n})();\n\n// Read the slot back after writing. If two bookings landed at the same time, the earliest created wins\n// and every other copy deletes itself. Google Calendar has no lock, so this is the safety net.\nconst d = $('Decide').item.json;\nconst S = d.settings;\nconst created = $('Create Event').item.json || {};\nconst list = $json || {};\nif (!created.id) {\n  return { json: { ...d, action: 'error', outcome: 'error', is_error: true, delete_ours: false, text: 'Could not save the booking to the calendar. Nothing was booked. Take a message for the owner.' } };\n}\nconst ours = { id: created.id, created: created.created || new Date().toISOString(), key: d.key };\nconst events = (Array.isArray(list.items) ? list.items : [])\n  .filter(e => e.transparency !== 'transparent')\n  .map(e => ({ id: e.id, created: e.created, status: e.status, key: e.extendedProperties && e.extendedProperties.private ? e.extendedProperties.private.nobsai_key : '' }));\nconst v = NB.verifyWinner(ours, events);\nconst st = $getWorkflowStaticData('global');\nst.ledger = st.ledger || {};\nif (v.outcome !== 'lost') st.ledger[d.key] = { code: d.code, start: d.start, event_id: v.outcome === 'won' ? created.id : v.winner_id, at: new Date().toISOString() };\n// Keep the ledger small: drop bookings that started more than 30 days ago.\nfor (const k of Object.keys(st.ledger)) { if (Date.parse(st.ledger[k].start) < Date.now() - 30 * 86400000) delete st.ledger[k]; }\nreturn { json: { ...d, outcome: v.outcome, event_id: created.id, verify_read_ok: Array.isArray(list.items), delete_ours: v.outcome !== 'won', action: v.outcome === 'won' ? 'booked' : v.outcome, text: NB.finalText(d, v.outcome, S) } };\n",
+        "mode": "runOnceForEachItem"
+      }
+    },
+    {
+      "id": "db836def-8516-43fa-983e-609dbf1aab5f",
+      "name": "Delete Our Copy?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "8f838849-251e-4c85-992b-eb6595be3177",
+              "leftValue": "={{ $json.delete_ours === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "1de3613c-5e07-4257-a2c4-d94d77c3fc4a",
+      "name": "Delete Our Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3080,
+        100
+      ],
+      "parameters": {
+        "method": "DELETE",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($json.settings.google_calendar_id) }}/events/{{ $json.event_id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {}
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "b5a96554-33ad-4d31-b5ab-7ca5d4c11b92",
+      "name": "Restore Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3300,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// The delete call returns an empty body. Put the booking result back on the item.\nreturn { json: $('Verify Winner').item.json };\n",
+        "mode": "runOnceForEachItem"
+      }
+    },
+    {
+      "id": "a81dfc0f-9cf9-49c2-a0a7-51b2b35e5514",
+      "name": "Demo Write",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// No BS AI booking logic. Shared, dependency free.\n// The same text is pasted into the n8n Code nodes, run by test_logic.js in Node,\n// and run in the browser sandbox page. Edit here, then run build_workflow.py.\nconst NB = (function () {\n  const WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\n  function pad(n) { return String(n).padStart(2, '0'); }\n  function clean(s) { return String(s == null ? '' : s).replace(/[\\u202f\\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim(); }\n\n  // ---------- time zone helpers (Intl only, no libraries) ----------\n  function partsInTz(ms, tz) {\n    const f = new Intl.DateTimeFormat('en-US', {\n      timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',\n      hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'short',\n    });\n    const o = {};\n    for (const p of f.formatToParts(new Date(ms))) o[p.type] = p.value;\n    return { y: +o.year, m: +o.month, d: +o.day, h: (+o.hour) % 24, mi: +o.minute, s: +o.second, wd: WD.indexOf(o.weekday) };\n  }\n  function tzOffsetMin(ms, tz) {\n    const p = partsInTz(ms, tz);\n    const asUtc = Date.UTC(p.y, p.m - 1, p.d, p.h, p.mi, p.s);\n    return Math.round((asUtc - Math.floor(ms / 1000) * 1000) / 60000);\n  }\n  function localToMs(y, m, d, h, mi, tz) {\n    const guess = Date.UTC(y, m - 1, d, h, mi);\n    const off = tzOffsetMin(guess, tz);\n    let ms = guess - off * 60000;\n    const off2 = tzOffsetMin(ms, tz);\n    if (off2 !== off) ms = guess - off2 * 60000;\n    return ms;\n  }\n  function isoLocal(ms, tz) {\n    const p = partsInTz(ms, tz);\n    const off = tzOffsetMin(ms, tz);\n    const a = Math.abs(off);\n    return p.y + '-' + pad(p.m) + '-' + pad(p.d) + 'T' + pad(p.h) + ':' + pad(p.mi) + ':00' +\n      (off >= 0 ? '+' : '-') + pad(Math.floor(a / 60)) + ':' + pad(a % 60);\n  }\n  function speakDay(ms, tz) {\n    return clean(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long', month: 'short', day: 'numeric' }).format(new Date(ms)));\n  }\n  function speakTime(ms, tz) {\n    return clean(new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).format(new Date(ms)));\n  }\n  function addDays(y, m, d, n) {\n    const t = new Date(Date.UTC(y, m - 1, d + n));\n    return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate() };\n  }\n  function hm(str, fallback) {\n    const m = /^(\\d{1,2}):?(\\d{2})?$/.exec(String(str || '').trim());\n    if (!m) return fallback;\n    return (+m[1]) * 60 + (+(m[2] || 0));\n  }\n\n  // Accepts \"2026-11-17\", \"2026-11-17 14:00\", \"2026-11-17T14:00\", or a full ISO with offset or Z.\n  function parseWhen(raw, tz) {\n    const s = String(raw == null ? '' : raw).trim();\n    if (!s) return null;\n    let m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(s);\n    if (m) return { dateOnly: true, y: +m[1], m: +m[2], d: +m[3], ms: localToMs(+m[1], +m[2], +m[3], 0, 0, tz) };\n    m = /^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{1,2}):(\\d{2})(?::\\d{2}(?:\\.\\d+)?)?$/.exec(s);\n    if (m) {\n      const ms = localToMs(+m[1], +m[2], +m[3], +m[4], +m[5], tz);\n      return { dateOnly: false, y: +m[1], m: +m[2], d: +m[3], ms };\n    }\n    if (/^\\d{4}-\\d{2}-\\d{2}T\\d{1,2}:\\d{2}.*(Z|[+-]\\d{2}:?\\d{2})$/i.test(s)) {\n      const ms = Date.parse(s);\n      if (isNaN(ms)) return null;\n      const p = partsInTz(ms, tz);\n      return { dateOnly: false, y: p.y, m: p.m, d: p.d, ms };\n    }\n    return null;\n  }\n\n  // ---------- settings ----------\n  function normSettings(s) {\n    s = s || {};\n    const days = String(s.open_days == null ? '1,2,3,4,5,6' : s.open_days)\n      .split(',').map(x => parseInt(x, 10)).filter(x => x >= 0 && x <= 6);\n    let brk = null;\n    const bm = /^(\\d{1,2}:\\d{2})\\s*-\\s*(\\d{1,2}:\\d{2})$/.exec(String(s.break_time || '').trim());\n    if (bm) brk = [hm(bm[1]), hm(bm[2])];\n    return {\n      business_name: String(s.business_name || 'the shop'),\n      timezone: String(s.timezone || 'America/New_York'),\n      open_days: days,\n      open_min: hm(s.open_time, 9 * 60),\n      close_min: hm(s.close_time, 17 * 60),\n      break_min: brk,\n      slot_minutes: Math.max(5, parseInt(s.slot_minutes, 10) || 60),\n      buffer_minutes: Math.max(0, parseInt(s.buffer_minutes, 10) || 0),\n      lead_minutes: Math.max(0, parseInt(s.lead_minutes == null ? 60 : s.lead_minutes, 10) || 0),\n      max_offer: Math.max(1, parseInt(s.max_offer, 10) || 3),\n      lookahead_days: Math.min(60, Math.max(1, parseInt(s.lookahead_days, 10) || 14)),\n      calendar_mode: String(s.calendar_mode || 'demo') === 'google' ? 'google' : 'demo',\n      google_calendar_id: String(s.google_calendar_id || 'primary'),\n    };\n  }\n\n  // ---------- request parsing ----------\n  function parseArgs(a) {\n    if (a == null) return {};\n    if (typeof a === 'string') { try { const o = JSON.parse(a); return (o && typeof o === 'object') ? o : {}; } catch (e) { return {}; } }\n    return typeof a === 'object' ? a : {};\n  }\n  function toolKind(name) {\n    const n = String(name || '').toLowerCase().replace(/[^a-z_]/g, '');\n    if (['check_availability', 'checkavailability', 'get_availability', 'get_open_slots', 'check_calendar', 'availability'].includes(n)) return 'check';\n    if (['book_appointment', 'bookappointment', 'book', 'create_booking', 'book_consultation', 'create_appointment'].includes(n)) return 'book';\n    if (n === 'reset_demo') return 'reset';\n    return 'unknown';\n  }\n  // Returns { source, calls: [{ toolCallId, name, kind, args, callId, phone }] }\n  function normalizeRequest(body) {\n    body = body || {};\n    const msg = body.message;\n    if (msg && typeof msg === 'object') {\n      const list = Array.isArray(msg.toolCallList) ? msg.toolCallList : (Array.isArray(msg.toolCalls) ? msg.toolCalls : []);\n      const call = msg.call || {};\n      const phone = (call.customer && call.customer.number) || (msg.customer && msg.customer.number) || '';\n      return {\n        source: 'vapi',\n        calls: list.map(tc => {\n          const fn = tc.function || {};\n          return { toolCallId: String(tc.id || ''), name: fn.name || tc.name || '', kind: toolKind(fn.name || tc.name), args: parseArgs(fn.arguments || tc.arguments), callId: String(call.id || ''), phone: String(phone || '') };\n        }),\n      };\n    }\n    if (body.name && body.args !== undefined) {\n      const call = body.call || {};\n      return { source: 'retell', calls: [{ toolCallId: '', name: body.name, kind: toolKind(body.name), args: parseArgs(body.args), callId: String(call.call_id || ''), phone: String(call.from_number || '') }] };\n    }\n    if (body.tool) {\n      return { source: 'simple', calls: [{ toolCallId: String(body.tool_call_id || 'test-1'), name: body.tool, kind: toolKind(body.tool), args: parseArgs(body.args), callId: String(body.call_id || ''), phone: String(body.caller_phone || '') }] };\n    }\n    return { source: 'unknown', calls: [] };\n  }\n\n  // ---------- calendar math ----------\n  function overlaps(a0, a1, b0, b1) { return a0 < b1 && b0 < a1; }\n  function busyMs(busy) {\n    return (busy || []).map(b => ({ s: Date.parse(b.start), e: Date.parse(b.end) })).filter(b => !isNaN(b.s) && !isNaN(b.e));\n  }\n  // Why a time is not bookable, or '' if it is.\n  function blockReason(startMs, S, busy, nowMs) {\n    const endMs = startMs + S.slot_minutes * 60000;\n    const p = partsInTz(startMs, S.timezone);\n    const startMin = p.h * 60 + p.mi;\n    const endMin = startMin + S.slot_minutes;\n    if (startMs < nowMs + S.lead_minutes * 60000) return 'too_soon';\n    if (!S.open_days.includes(p.wd)) return 'closed';\n    if (startMin < S.open_min || endMin > S.close_min) return 'closed';\n    if (S.break_min && overlaps(startMin, endMin, S.break_min[0], S.break_min[1])) return 'closed';\n    const buf = S.buffer_minutes * 60000;\n    for (const b of busyMs(busy)) if (overlaps(startMs - buf, endMs + buf, b.s, b.e)) return 'taken';\n    return '';\n  }\n  function slotsForDay(y, m, d, S, busy, nowMs) {\n    const out = [];\n    for (let t = S.open_min; t + S.slot_minutes <= S.close_min; t += S.slot_minutes) {\n      const ms = localToMs(y, m, d, Math.floor(t / 60), t % 60, S.timezone);\n      if (!blockReason(ms, S, busy, nowMs)) out.push(ms);\n    }\n    return out;\n  }\n  // Up to max open slots, starting on the given local day.\n  function findOpen(y, m, d, S, busy, nowMs, max) {\n    const out = [];\n    for (let i = 0; i < S.lookahead_days && out.length < max; i++) {\n      const day = addDays(y, m, d, i);\n      for (const ms of slotsForDay(day.y, day.m, day.d, S, busy, nowMs)) { if (out.length < max) out.push(ms); }\n    }\n    return out;\n  }\n  function listSlots(slots, S, knownDay) {\n    if (!slots.length) return '';\n    const tz = S.timezone;\n    let lastDay = knownDay || '';\n    const parts = slots.map(ms => {\n      const day = speakDay(ms, tz);\n      const txt = (day !== lastDay ? day + ' at ' : '') + speakTime(ms, tz) + ' (start ' + isoLocal(ms, tz) + ')';\n      lastDay = day;\n      return txt;\n    });\n    return parts.join('; ');\n  }\n\n  // Free/busy window to read before deciding. For a booking we read the booked day through the lookahead,\n  // so we can offer other times if the slot is gone.\n  function windowFor(call, S, nowMs) {\n    const tz = S.timezone;\n    const raw = call.kind === 'book' ? (call.args.start || call.args.datetime || call.args.start_time) : (call.args.date || call.args.day || call.args.start);\n    const w = parseWhen(raw, tz);\n    const base = w || (() => { const p = partsInTz(nowMs, tz); return { y: p.y, m: p.m, d: p.d }; })();\n    const end = addDays(base.y, base.m, base.d, S.lookahead_days + 1);\n    return { timeMin: new Date(localToMs(base.y, base.m, base.d, 0, 0, tz)).toISOString(), timeMax: new Date(localToMs(end.y, end.m, end.d, 0, 0, tz)).toISOString() };\n  }\n\n  function hash(str) {\n    let h = 2166136261;\n    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }\n    return (h >>> 0).toString(36).toUpperCase().slice(0, 6);\n  }\n  function bookingKey(call, startIso) {\n    const who = call.callId || call.phone || String(call.args.phone || '') || String(call.args.name || '') || 'anon';\n    return who + '|' + startIso;\n  }\n\n  // Decide what to do with one tool call. busy is [{start,end}] read fresh from the calendar.\n  // ledger is { key: { code, start, event_id } } of bookings this workflow already made.\n  function decide(call, S, busy, ledger, nowMs) {\n    const tz = S.timezone;\n    ledger = ledger || {};\n    if (call.kind === 'check') {\n      const raw = call.args.date || call.args.day || call.args.start;\n      let w = parseWhen(raw, tz);\n      if (raw && !w) return { action: 'error', text: 'I could not read that date. Send date as YYYY-MM-DD.' };\n      if (!w) { const p = partsInTz(nowMs, tz); w = { y: p.y, m: p.m, d: p.d }; }\n      const day = slotsForDay(w.y, w.m, w.d, S, busy, nowMs).slice(0, S.max_offer);\n      const label = speakDay(localToMs(w.y, w.m, w.d, 12, 0, tz), tz);\n      if (day.length) return { action: 'reply', slots: day.map(ms => isoLocal(ms, tz)), text: 'Open times on ' + label + ': ' + listSlots(day, S, label) + '. To book, pass the start value exactly. Times are ' + tz + '.' };\n      const next = findOpen(addDays(w.y, w.m, w.d, 1).y, addDays(w.y, w.m, w.d, 1).m, addDays(w.y, w.m, w.d, 1).d, S, busy, nowMs, S.max_offer);\n      if (next.length) return { action: 'reply', slots: next.map(ms => isoLocal(ms, tz)), text: 'No open times on ' + label + '. Next open: ' + listSlots(next, S) + '. Times are ' + tz + '.' };\n      return { action: 'reply', slots: [], text: 'No open times in the next ' + S.lookahead_days + ' days. Offer to take a message for the owner.' };\n    }\n    if (call.kind === 'book') {\n      const raw = call.args.start || call.args.datetime || call.args.start_time;\n      const w = parseWhen(raw, tz);\n      if (!w || w.dateOnly) return { action: 'error', text: 'I need the start time, like 2026-11-17T14:00. Check availability first and pass the start value exactly.' };\n      const startMs = w.ms;\n      const startIso = isoLocal(startMs, tz);\n      const endIso = isoLocal(startMs + S.slot_minutes * 60000, tz);\n      const key = bookingKey(call, startIso);\n      if (ledger[key]) {\n        return { action: 'duplicate', key, start: startIso, code: ledger[key].code, text: 'Already booked for ' + speakDay(startMs, tz) + ' at ' + speakTime(startMs, tz) + '. Confirmation ' + ledger[key].code + '. Do not book again.' };\n      }\n      const why = blockReason(startMs, S, busy, nowMs);\n      if (why) {\n        const p = partsInTz(startMs, tz);\n        const alt = findOpen(p.y, p.m, p.d, S, busy, nowMs, S.max_offer);\n        const lead = why === 'taken' ? 'That time is already taken.' : why === 'too_soon' ? 'That time is too soon or in the past.' : 'We are closed at that time.';\n        return { action: why, start: startIso, slots: alt.map(ms => isoLocal(ms, tz)), text: lead + (alt.length ? ' Open times: ' + listSlots(alt, S) + '.' : ' No open times soon. Offer to take a message.') + ' Nothing was booked.' };\n      }\n      const name = clean(call.args.name || call.args.customer_name || 'Caller').slice(0, 80);\n      const phone = clean(call.args.phone || call.phone || '').slice(0, 30);\n      const service = clean(call.args.service || 'Appointment').slice(0, 80);\n      const notes = clean(call.args.notes || '').slice(0, 300);\n      return {\n        action: 'create', key, start: startIso, end: endIso, code: 'NB-' + hash(key),\n        event: {\n          summary: service + ' - ' + name,\n          description: 'Booked by the AI phone agent. Phone: ' + (phone || 'not given') + (notes ? '. Notes: ' + notes : '') + '. Booking key: ' + key,\n          start: { dateTime: startIso, timeZone: tz },\n          end: { dateTime: endIso, timeZone: tz },\n          extendedProperties: { private: { nobsai_key: key } },\n        },\n      };\n    }\n    if (call.kind === 'reset') return { action: 'reset', text: 'Demo calendar cleared.' };\n    return { action: 'error', text: 'Unknown tool ' + clean(call.name) + '. Use check_availability or book_appointment.' };\n  }\n\n  // After we write, read the slot back. If two bookings landed at once, the earliest created wins.\n  // events: [{ id, created, status, key }] overlapping the slot. ours: { id, created, key }.\n  function verifyWinner(ours, events) {\n    const list = (events || []).filter(e => e && e.id && e.status !== 'cancelled');\n    if (!list.some(e => e.id === ours.id)) list.push(ours);\n    list.sort((a, b) => (Date.parse(a.created) - Date.parse(b.created)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));\n    const first = list[0];\n    if (first.id === ours.id) return { outcome: 'won' };\n    if (first.key && first.key === ours.key) return { outcome: 'duplicate', winner_id: first.id };\n    return { outcome: 'lost', winner_id: first.id };\n  }\n\n  function finalText(d, outcome, S) {\n    const tz = S.timezone;\n    const ms = Date.parse(d.start);\n    const when = speakDay(ms, tz) + ' at ' + speakTime(ms, tz);\n    if (outcome === 'won') return 'Booked for ' + when + '. Confirmation ' + d.code + '.';\n    if (outcome === 'duplicate') return 'Already booked for ' + when + '. Confirmation ' + d.code + '. Do not book again.';\n    return 'Sorry, ' + when + ' was just taken by another caller. Nothing was booked. Check availability again and offer another time.';\n  }\n\n  // Build the HTTP body the voice platform expects. Always sent with HTTP 200.\n  function buildResponse(source, results) {\n    const flat = s => clean(s).slice(0, 1000);\n    if (source === 'vapi') {\n      return { results: results.map(r => r.is_error ? { toolCallId: r.toolCallId, error: flat(r.text) } : { toolCallId: r.toolCallId, result: flat(r.text) }) };\n    }\n    if (source === 'retell') {\n      const r = results[0] || { text: 'No tool call found.', action: 'error' };\n      return { result: flat(r.text), action: r.action || '', start: r.start || '', code: r.code || '' };\n    }\n    if (source === 'simple') {\n      return { results: results.map(r => ({ toolCallId: r.toolCallId, action: r.action, result: flat(r.text), start: r.start || '', code: r.code || '', slots: r.slots || [] })) };\n    }\n    return { ok: true, note: 'No tool calls in this request.' };\n  }\n\n  return { partsInTz, tzOffsetMin, localToMs, isoLocal, speakDay, speakTime, parseWhen, normSettings, normalizeRequest, toolKind, blockReason, slotsForDay, findOpen, windowFor, decide, verifyWinner, finalText, buildResponse, bookingKey, hash };\n})();\n\n// Practice calendar write, with the same read-back check as the Google path.\nconst d = $json;\nconst S = d.settings;\nconst st = $getWorkflowStaticData('global');\nst.demo_events = st.demo_events || [];\nst.ledger = st.ledger || {};\nst.demo_n = (st.demo_n || 0) + 1;\nconst ev = { id: 'demo-' + st.demo_n, created: new Date().toISOString(), start: d.start, end: d.end, key: d.key, summary: d.event.summary };\nst.demo_events.push(ev);\nconst s0 = Date.parse(d.start), s1 = Date.parse(d.end);\nconst overlapping = st.demo_events.filter(e => Date.parse(e.start) < s1 && s0 < Date.parse(e.end));\nconst v = NB.verifyWinner(ev, overlapping);\nif (v.outcome !== 'won') st.demo_events = st.demo_events.filter(e => e.id !== ev.id);\nif (v.outcome !== 'lost') st.ledger[d.key] = { code: d.code, start: d.start, event_id: v.outcome === 'won' ? ev.id : v.winner_id, at: new Date().toISOString() };\nif (st.demo_events.length > 200) st.demo_events = st.demo_events.slice(-200);\nreturn { json: { ...d, outcome: v.outcome, event_id: ev.id, action: v.outcome === 'won' ? 'booked' : v.outcome, text: NB.finalText(d, v.outcome, S) } };\n",
+        "mode": "runOnceForEachItem"
+      }
+    },
+    {
+      "id": "fba530d3-7ee6-47e6-8f7e-839d778434e3",
+      "name": "Build Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// No BS AI booking logic. Shared, dependency free.\n// The same text is pasted into the n8n Code nodes, run by test_logic.js in Node,\n// and run in the browser sandbox page. Edit here, then run build_workflow.py.\nconst NB = (function () {\n  const WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\n  function pad(n) { return String(n).padStart(2, '0'); }\n  function clean(s) { return String(s == null ? '' : s).replace(/[\\u202f\\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim(); }\n\n  // ---------- time zone helpers (Intl only, no libraries) ----------\n  function partsInTz(ms, tz) {\n    const f = new Intl.DateTimeFormat('en-US', {\n      timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',\n      hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'short',\n    });\n    const o = {};\n    for (const p of f.formatToParts(new Date(ms))) o[p.type] = p.value;\n    return { y: +o.year, m: +o.month, d: +o.day, h: (+o.hour) % 24, mi: +o.minute, s: +o.second, wd: WD.indexOf(o.weekday) };\n  }\n  function tzOffsetMin(ms, tz) {\n    const p = partsInTz(ms, tz);\n    const asUtc = Date.UTC(p.y, p.m - 1, p.d, p.h, p.mi, p.s);\n    return Math.round((asUtc - Math.floor(ms / 1000) * 1000) / 60000);\n  }\n  function localToMs(y, m, d, h, mi, tz) {\n    const guess = Date.UTC(y, m - 1, d, h, mi);\n    const off = tzOffsetMin(guess, tz);\n    let ms = guess - off * 60000;\n    const off2 = tzOffsetMin(ms, tz);\n    if (off2 !== off) ms = guess - off2 * 60000;\n    return ms;\n  }\n  function isoLocal(ms, tz) {\n    const p = partsInTz(ms, tz);\n    const off = tzOffsetMin(ms, tz);\n    const a = Math.abs(off);\n    return p.y + '-' + pad(p.m) + '-' + pad(p.d) + 'T' + pad(p.h) + ':' + pad(p.mi) + ':00' +\n      (off >= 0 ? '+' : '-') + pad(Math.floor(a / 60)) + ':' + pad(a % 60);\n  }\n  function speakDay(ms, tz) {\n    return clean(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long', month: 'short', day: 'numeric' }).format(new Date(ms)));\n  }\n  function speakTime(ms, tz) {\n    return clean(new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).format(new Date(ms)));\n  }\n  function addDays(y, m, d, n) {\n    const t = new Date(Date.UTC(y, m - 1, d + n));\n    return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate() };\n  }\n  function hm(str, fallback) {\n    const m = /^(\\d{1,2}):?(\\d{2})?$/.exec(String(str || '').trim());\n    if (!m) return fallback;\n    return (+m[1]) * 60 + (+(m[2] || 0));\n  }\n\n  // Accepts \"2026-11-17\", \"2026-11-17 14:00\", \"2026-11-17T14:00\", or a full ISO with offset or Z.\n  function parseWhen(raw, tz) {\n    const s = String(raw == null ? '' : raw).trim();\n    if (!s) return null;\n    let m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(s);\n    if (m) return { dateOnly: true, y: +m[1], m: +m[2], d: +m[3], ms: localToMs(+m[1], +m[2], +m[3], 0, 0, tz) };\n    m = /^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{1,2}):(\\d{2})(?::\\d{2}(?:\\.\\d+)?)?$/.exec(s);\n    if (m) {\n      const ms = localToMs(+m[1], +m[2], +m[3], +m[4], +m[5], tz);\n      return { dateOnly: false, y: +m[1], m: +m[2], d: +m[3], ms };\n    }\n    if (/^\\d{4}-\\d{2}-\\d{2}T\\d{1,2}:\\d{2}.*(Z|[+-]\\d{2}:?\\d{2})$/i.test(s)) {\n      const ms = Date.parse(s);\n      if (isNaN(ms)) return null;\n      const p = partsInTz(ms, tz);\n      return { dateOnly: false, y: p.y, m: p.m, d: p.d, ms };\n    }\n    return null;\n  }\n\n  // ---------- settings ----------\n  function normSettings(s) {\n    s = s || {};\n    const days = String(s.open_days == null ? '1,2,3,4,5,6' : s.open_days)\n      .split(',').map(x => parseInt(x, 10)).filter(x => x >= 0 && x <= 6);\n    let brk = null;\n    const bm = /^(\\d{1,2}:\\d{2})\\s*-\\s*(\\d{1,2}:\\d{2})$/.exec(String(s.break_time || '').trim());\n    if (bm) brk = [hm(bm[1]), hm(bm[2])];\n    return {\n      business_name: String(s.business_name || 'the shop'),\n      timezone: String(s.timezone || 'America/New_York'),\n      open_days: days,\n      open_min: hm(s.open_time, 9 * 60),\n      close_min: hm(s.close_time, 17 * 60),\n      break_min: brk,\n      slot_minutes: Math.max(5, parseInt(s.slot_minutes, 10) || 60),\n      buffer_minutes: Math.max(0, parseInt(s.buffer_minutes, 10) || 0),\n      lead_minutes: Math.max(0, parseInt(s.lead_minutes == null ? 60 : s.lead_minutes, 10) || 0),\n      max_offer: Math.max(1, parseInt(s.max_offer, 10) || 3),\n      lookahead_days: Math.min(60, Math.max(1, parseInt(s.lookahead_days, 10) || 14)),\n      calendar_mode: String(s.calendar_mode || 'demo') === 'google' ? 'google' : 'demo',\n      google_calendar_id: String(s.google_calendar_id || 'primary'),\n    };\n  }\n\n  // ---------- request parsing ----------\n  function parseArgs(a) {\n    if (a == null) return {};\n    if (typeof a === 'string') { try { const o = JSON.parse(a); return (o && typeof o === 'object') ? o : {}; } catch (e) { return {}; } }\n    return typeof a === 'object' ? a : {};\n  }\n  function toolKind(name) {\n    const n = String(name || '').toLowerCase().replace(/[^a-z_]/g, '');\n    if (['check_availability', 'checkavailability', 'get_availability', 'get_open_slots', 'check_calendar', 'availability'].includes(n)) return 'check';\n    if (['book_appointment', 'bookappointment', 'book', 'create_booking', 'book_consultation', 'create_appointment'].includes(n)) return 'book';\n    if (n === 'reset_demo') return 'reset';\n    return 'unknown';\n  }\n  // Returns { source, calls: [{ toolCallId, name, kind, args, callId, phone }] }\n  function normalizeRequest(body) {\n    body = body || {};\n    const msg = body.message;\n    if (msg && typeof msg === 'object') {\n      const list = Array.isArray(msg.toolCallList) ? msg.toolCallList : (Array.isArray(msg.toolCalls) ? msg.toolCalls : []);\n      const call = msg.call || {};\n      const phone = (call.customer && call.customer.number) || (msg.customer && msg.customer.number) || '';\n      return {\n        source: 'vapi',\n        calls: list.map(tc => {\n          const fn = tc.function || {};\n          return { toolCallId: String(tc.id || ''), name: fn.name || tc.name || '', kind: toolKind(fn.name || tc.name), args: parseArgs(fn.arguments || tc.arguments), callId: String(call.id || ''), phone: String(phone || '') };\n        }),\n      };\n    }\n    if (body.name && body.args !== undefined) {\n      const call = body.call || {};\n      return { source: 'retell', calls: [{ toolCallId: '', name: body.name, kind: toolKind(body.name), args: parseArgs(body.args), callId: String(call.call_id || ''), phone: String(call.from_number || '') }] };\n    }\n    if (body.tool) {\n      return { source: 'simple', calls: [{ toolCallId: String(body.tool_call_id || 'test-1'), name: body.tool, kind: toolKind(body.tool), args: parseArgs(body.args), callId: String(body.call_id || ''), phone: String(body.caller_phone || '') }] };\n    }\n    return { source: 'unknown', calls: [] };\n  }\n\n  // ---------- calendar math ----------\n  function overlaps(a0, a1, b0, b1) { return a0 < b1 && b0 < a1; }\n  function busyMs(busy) {\n    return (busy || []).map(b => ({ s: Date.parse(b.start), e: Date.parse(b.end) })).filter(b => !isNaN(b.s) && !isNaN(b.e));\n  }\n  // Why a time is not bookable, or '' if it is.\n  function blockReason(startMs, S, busy, nowMs) {\n    const endMs = startMs + S.slot_minutes * 60000;\n    const p = partsInTz(startMs, S.timezone);\n    const startMin = p.h * 60 + p.mi;\n    const endMin = startMin + S.slot_minutes;\n    if (startMs < nowMs + S.lead_minutes * 60000) return 'too_soon';\n    if (!S.open_days.includes(p.wd)) return 'closed';\n    if (startMin < S.open_min || endMin > S.close_min) return 'closed';\n    if (S.break_min && overlaps(startMin, endMin, S.break_min[0], S.break_min[1])) return 'closed';\n    const buf = S.buffer_minutes * 60000;\n    for (const b of busyMs(busy)) if (overlaps(startMs - buf, endMs + buf, b.s, b.e)) return 'taken';\n    return '';\n  }\n  function slotsForDay(y, m, d, S, busy, nowMs) {\n    const out = [];\n    for (let t = S.open_min; t + S.slot_minutes <= S.close_min; t += S.slot_minutes) {\n      const ms = localToMs(y, m, d, Math.floor(t / 60), t % 60, S.timezone);\n      if (!blockReason(ms, S, busy, nowMs)) out.push(ms);\n    }\n    return out;\n  }\n  // Up to max open slots, starting on the given local day.\n  function findOpen(y, m, d, S, busy, nowMs, max) {\n    const out = [];\n    for (let i = 0; i < S.lookahead_days && out.length < max; i++) {\n      const day = addDays(y, m, d, i);\n      for (const ms of slotsForDay(day.y, day.m, day.d, S, busy, nowMs)) { if (out.length < max) out.push(ms); }\n    }\n    return out;\n  }\n  function listSlots(slots, S, knownDay) {\n    if (!slots.length) return '';\n    const tz = S.timezone;\n    let lastDay = knownDay || '';\n    const parts = slots.map(ms => {\n      const day = speakDay(ms, tz);\n      const txt = (day !== lastDay ? day + ' at ' : '') + speakTime(ms, tz) + ' (start ' + isoLocal(ms, tz) + ')';\n      lastDay = day;\n      return txt;\n    });\n    return parts.join('; ');\n  }\n\n  // Free/busy window to read before deciding. For a booking we read the booked day through the lookahead,\n  // so we can offer other times if the slot is gone.\n  function windowFor(call, S, nowMs) {\n    const tz = S.timezone;\n    const raw = call.kind === 'book' ? (call.args.start || call.args.datetime || call.args.start_time) : (call.args.date || call.args.day || call.args.start);\n    const w = parseWhen(raw, tz);\n    const base = w || (() => { const p = partsInTz(nowMs, tz); return { y: p.y, m: p.m, d: p.d }; })();\n    const end = addDays(base.y, base.m, base.d, S.lookahead_days + 1);\n    return { timeMin: new Date(localToMs(base.y, base.m, base.d, 0, 0, tz)).toISOString(), timeMax: new Date(localToMs(end.y, end.m, end.d, 0, 0, tz)).toISOString() };\n  }\n\n  function hash(str) {\n    let h = 2166136261;\n    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }\n    return (h >>> 0).toString(36).toUpperCase().slice(0, 6);\n  }\n  function bookingKey(call, startIso) {\n    const who = call.callId || call.phone || String(call.args.phone || '') || String(call.args.name || '') || 'anon';\n    return who + '|' + startIso;\n  }\n\n  // Decide what to do with one tool call. busy is [{start,end}] read fresh from the calendar.\n  // ledger is { key: { code, start, event_id } } of bookings this workflow already made.\n  function decide(call, S, busy, ledger, nowMs) {\n    const tz = S.timezone;\n    ledger = ledger || {};\n    if (call.kind === 'check') {\n      const raw = call.args.date || call.args.day || call.args.start;\n      let w = parseWhen(raw, tz);\n      if (raw && !w) return { action: 'error', text: 'I could not read that date. Send date as YYYY-MM-DD.' };\n      if (!w) { const p = partsInTz(nowMs, tz); w = { y: p.y, m: p.m, d: p.d }; }\n      const day = slotsForDay(w.y, w.m, w.d, S, busy, nowMs).slice(0, S.max_offer);\n      const label = speakDay(localToMs(w.y, w.m, w.d, 12, 0, tz), tz);\n      if (day.length) return { action: 'reply', slots: day.map(ms => isoLocal(ms, tz)), text: 'Open times on ' + label + ': ' + listSlots(day, S, label) + '. To book, pass the start value exactly. Times are ' + tz + '.' };\n      const next = findOpen(addDays(w.y, w.m, w.d, 1).y, addDays(w.y, w.m, w.d, 1).m, addDays(w.y, w.m, w.d, 1).d, S, busy, nowMs, S.max_offer);\n      if (next.length) return { action: 'reply', slots: next.map(ms => isoLocal(ms, tz)), text: 'No open times on ' + label + '. Next open: ' + listSlots(next, S) + '. Times are ' + tz + '.' };\n      return { action: 'reply', slots: [], text: 'No open times in the next ' + S.lookahead_days + ' days. Offer to take a message for the owner.' };\n    }\n    if (call.kind === 'book') {\n      const raw = call.args.start || call.args.datetime || call.args.start_time;\n      const w = parseWhen(raw, tz);\n      if (!w || w.dateOnly) return { action: 'error', text: 'I need the start time, like 2026-11-17T14:00. Check availability first and pass the start value exactly.' };\n      const startMs = w.ms;\n      const startIso = isoLocal(startMs, tz);\n      const endIso = isoLocal(startMs + S.slot_minutes * 60000, tz);\n      const key = bookingKey(call, startIso);\n      if (ledger[key]) {\n        return { action: 'duplicate', key, start: startIso, code: ledger[key].code, text: 'Already booked for ' + speakDay(startMs, tz) + ' at ' + speakTime(startMs, tz) + '. Confirmation ' + ledger[key].code + '. Do not book again.' };\n      }\n      const why = blockReason(startMs, S, busy, nowMs);\n      if (why) {\n        const p = partsInTz(startMs, tz);\n        const alt = findOpen(p.y, p.m, p.d, S, busy, nowMs, S.max_offer);\n        const lead = why === 'taken' ? 'That time is already taken.' : why === 'too_soon' ? 'That time is too soon or in the past.' : 'We are closed at that time.';\n        return { action: why, start: startIso, slots: alt.map(ms => isoLocal(ms, tz)), text: lead + (alt.length ? ' Open times: ' + listSlots(alt, S) + '.' : ' No open times soon. Offer to take a message.') + ' Nothing was booked.' };\n      }\n      const name = clean(call.args.name || call.args.customer_name || 'Caller').slice(0, 80);\n      const phone = clean(call.args.phone || call.phone || '').slice(0, 30);\n      const service = clean(call.args.service || 'Appointment').slice(0, 80);\n      const notes = clean(call.args.notes || '').slice(0, 300);\n      return {\n        action: 'create', key, start: startIso, end: endIso, code: 'NB-' + hash(key),\n        event: {\n          summary: service + ' - ' + name,\n          description: 'Booked by the AI phone agent. Phone: ' + (phone || 'not given') + (notes ? '. Notes: ' + notes : '') + '. Booking key: ' + key,\n          start: { dateTime: startIso, timeZone: tz },\n          end: { dateTime: endIso, timeZone: tz },\n          extendedProperties: { private: { nobsai_key: key } },\n        },\n      };\n    }\n    if (call.kind === 'reset') return { action: 'reset', text: 'Demo calendar cleared.' };\n    return { action: 'error', text: 'Unknown tool ' + clean(call.name) + '. Use check_availability or book_appointment.' };\n  }\n\n  // After we write, read the slot back. If two bookings landed at once, the earliest created wins.\n  // events: [{ id, created, status, key }] overlapping the slot. ours: { id, created, key }.\n  function verifyWinner(ours, events) {\n    const list = (events || []).filter(e => e && e.id && e.status !== 'cancelled');\n    if (!list.some(e => e.id === ours.id)) list.push(ours);\n    list.sort((a, b) => (Date.parse(a.created) - Date.parse(b.created)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));\n    const first = list[0];\n    if (first.id === ours.id) return { outcome: 'won' };\n    if (first.key && first.key === ours.key) return { outcome: 'duplicate', winner_id: first.id };\n    return { outcome: 'lost', winner_id: first.id };\n  }\n\n  function finalText(d, outcome, S) {\n    const tz = S.timezone;\n    const ms = Date.parse(d.start);\n    const when = speakDay(ms, tz) + ' at ' + speakTime(ms, tz);\n    if (outcome === 'won') return 'Booked for ' + when + '. Confirmation ' + d.code + '.';\n    if (outcome === 'duplicate') return 'Already booked for ' + when + '. Confirmation ' + d.code + '. Do not book again.';\n    return 'Sorry, ' + when + ' was just taken by another caller. Nothing was booked. Check availability again and offer another time.';\n  }\n\n  // Build the HTTP body the voice platform expects. Always sent with HTTP 200.\n  function buildResponse(source, results) {\n    const flat = s => clean(s).slice(0, 1000);\n    if (source === 'vapi') {\n      return { results: results.map(r => r.is_error ? { toolCallId: r.toolCallId, error: flat(r.text) } : { toolCallId: r.toolCallId, result: flat(r.text) }) };\n    }\n    if (source === 'retell') {\n      const r = results[0] || { text: 'No tool call found.', action: 'error' };\n      return { result: flat(r.text), action: r.action || '', start: r.start || '', code: r.code || '' };\n    }\n    if (source === 'simple') {\n      return { results: results.map(r => ({ toolCallId: r.toolCallId, action: r.action, result: flat(r.text), start: r.start || '', code: r.code || '', slots: r.slots || [] })) };\n    }\n    return { ok: true, note: 'No tool calls in this request.' };\n  }\n\n  return { partsInTz, tzOffsetMin, localToMs, isoLocal, speakDay, speakTime, parseWhen, normSettings, normalizeRequest, toolKind, blockReason, slotsForDay, findOpen, windowFor, decide, verifyWinner, finalText, buildResponse, bookingKey, hash };\n})();\n\n// One HTTP 200 answer for the whole request, in the shape the voice platform expects.\nconst items = $input.all().map(i => i.json);\nconst source = items.length ? items[0].source : 'unknown';\nconst results = items.filter(x => x.kind !== 'none').map(x => ({\n  toolCallId: x.toolCallId, text: x.text, is_error: !!x.is_error, action: x.action, start: x.start, code: x.code, slots: x.slots,\n}));\nreturn [{ json: NB.buildResponse(source, results) }];\n"
+      }
+    },
+    {
+      "id": "d8e59493-4a67-4b9f-a819-5704cc08c7bc",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        100
+      ],
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "744dbfd6-9cd6-4783-ae1a-95ed0184f1e7",
+      "name": "Read Me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -380
+      ],
+      "parameters": {
+        "content": "## No double booking (No BS AI template)\n\nBooking tool for a Vapi or Retell phone agent.\n\n1. check_availability reads the calendar and offers open times.\n2. book_appointment re-reads the calendar right before it writes. If the time is gone, nothing is booked and the caller gets other times.\n3. After the write it reads the slot back. If two callers booked at once, the earliest wins and the other copy deletes itself.\n4. A retried tool call returns the same confirmation instead of a second booking.\n\nAlways answers HTTP 200 in the shape Vapi expects: results, toolCallId, and a flat string.\n\nStarts in demo mode (no Google account needed). Set calendar_mode to google in Settings to go live.\n\nBuilt by Bobby Ve, No BS AI. Want it set up on your number? Text SETUP to (470) 779-2869\n",
+        "height": 360,
+        "width": 560
+      }
+    }
+  ],
+  "connections": {
+    "Booking Tool": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Parse Tool Calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Tool Calls": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Build Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Google Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Response": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Mode?": {
+      "main": [
+        [
+          {
+            "node": "Google Free/Busy",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Demo Busy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Free/Busy": {
+      "main": [
+        [
+          {
+            "node": "Attach Busy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Busy": {
+      "main": [
+        [
+          {
+            "node": "Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Demo Busy": {
+      "main": [
+        [
+          {
+            "node": "Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide": {
+      "main": [
+        [
+          {
+            "node": "Needs Write?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Write?": {
+      "main": [
+        [
+          {
+            "node": "Google Write?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Write?": {
+      "main": [
+        [
+          {
+            "node": "Create Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Demo Write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Event": {
+      "main": [
+        [
+          {
+            "node": "Read Slot Back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Slot Back": {
+      "main": [
+        [
+          {
+            "node": "Verify Winner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Winner": {
+      "main": [
+        [
+          {
+            "node": "Delete Our Copy?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Our Copy?": {
+      "main": [
+        [
+          {
+            "node": "Delete Our Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Our Event": {
+      "main": [
+        [
+          {
+            "node": "Restore Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Result": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Demo Write": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "builtBy": "Bobby Ve, No BS AI"
+  },
+  "tags": []
+}

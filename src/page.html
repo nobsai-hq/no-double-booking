@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>No double booking for AI phone agents | No BS AI</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg:#0f172a; --card:#111827; --line:#1f2937; --text:#e5e7eb; --muted:#9ca3af; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --link:#93c5fd; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  header, main, footer { padding-left:24px; padding-right:24px; }
+  header { padding-top:20px; padding-bottom:8px; }
+  h1 { font-size:22px; margin:0 0 8px; }
+  h2 { font-size:13px; margin:0 0 10px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  .lead { color:var(--muted); max-width:760px; margin:0 0 12px; }
+  .badges { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0 0; }
+  .badge { padding:3px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .sim { background:#3b2a05; color:#fcd34d; border-color:#92400e; }
+  .okb { background:#052e16; color:#86efac; border-color:#166534; }
+  .note { background:#3b2a05; border:1px solid #92400e; color:#fde68a; border-radius:10px; padding:12px 14px; margin:12px 24px 0; font-size:14px; }
+  .note p { margin:0 0 6px; } .note p:last-child { margin:0; }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:16px; padding-top:16px; padding-bottom:24px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } header, .note, main, footer, .cta { padding-left:16px; padding-right:16px; } .note, .cta { margin-left:16px; margin-right:16px; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+  .card p { margin:0 0 10px; } .card p:last-child { margin:0; }
+  ol, ul { margin:8px 0 0; padding-left:22px; } li { margin:0 0 8px; }
+  a { color:var(--link); }
+  button { padding:10px 12px; min-height:40px; border-radius:6px; border:1px solid #334155; background:#1e293b; color:var(--text); cursor:pointer; font-weight:600; font-size:15px; }
+  button.primary { background:#2563eb; border-color:#2563eb; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; align-items:center; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  .k-new { color:var(--ok); font-weight:600; } .k-dup { color:var(--warn); font-weight:600; } .k-bad { color:var(--bad); font-weight:600; }
+  .muted { color:var(--muted); }
+  code, pre { font-size:12px; }
+  pre { background:#0b1220; border:1px solid var(--line); border-radius:6px; padding:10px; white-space:pre-wrap; word-break:break-word; margin:8px 0 0; max-height:260px; overflow:auto; }
+  .slots { display:grid; grid-template-columns: repeat(4, 1fr); gap:6px; margin-top:8px; }
+  .slot { border:1px solid var(--line); border-radius:6px; padding:8px; font-size:13px; min-height:52px; }
+  .slot b { display:block; font-size:14px; }
+  .s-open { background:#0b1220; } .s-owner { background:#1f2937; color:var(--muted); } .s-booked { background:#052e16; border-color:#166534; } .s-double { background:#450a0a; border-color:#b91c1c; } .s-closed { background:#111827; color:#4b5563; }
+  .toggle { display:flex; gap:8px; align-items:center; font-size:14px; }
+  .cta { background:#0b1220; border:1px solid #1d4ed8; border-radius:10px; padding:16px 18px; margin:0 24px 24px; }
+  .cta p { margin:0 0 8px; } .cta p:last-child { margin:0; }
+  footer { color:var(--muted); font-size:13px; padding-bottom:28px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>No double booking for AI phone agents</h1>
+  <p class="lead">A free n8n booking tool by No BS AI for Vapi or Retell. It checks the calendar, books once, and refuses to double book, even when two callers grab the same time at once or the platform retries.</p>
+  <div class="badges">
+    <span class="badge sim">This page is a browser sandbox</span>
+    <span class="badge okb">Nothing is sent to a server</span>
+  </div>
+</header>
+
+<div class="note">
+  <p>This page does not book anything, does not touch a real calendar, and collects no data. It runs the same booking rules as the n8n workflow, in your browser.</p>
+  <p>Tested so far: on a local n8n 2.47.7 in demo mode, and in Google mode against a fake Google Calendar API. Not yet tested on a real Google account or a live phone call. Details are in TESTING.md on GitHub.</p>
+</div>
+
+<main>
+  <section class="card">
+    <h2>The question</h2>
+    <p>On the n8n forum, people building AI receptionists keep hitting the same three walls: Vapi says "No result returned", the agent books a time that was already taken, and two callers both get the last slot.</p>
+    <p class="muted">Example: @imel, Nov 29, 2025: "The check_availability custom tool keeps returning "No result returned" error in VAPI." <a href="https://community.n8n.io/t/vapi-check-availabilitycustom-tool-returns-no-result-returned-n8n-workflow-not-executing-either/228454">Thread</a>. @RodrigoSyncData, Nov 13, 2026: "two callers asking for the last slot at the same moment can both get it." <a href="https://community.n8n.io/t/retell-ai-mcp-n8n-an-ai-receptionist-that-books-consultations-and-escalates-to-a-human/328375">Thread</a>.</p>
+  </section>
+
+  <section class="card">
+    <h2>How the workflow handles it</h2>
+    <ol>
+      <li>Always answers HTTP 200 in the shape Vapi reads: <code>results</code>, <code>toolCallId</code>, one flat string.</li>
+      <li>Re-reads the calendar right before it writes. Taken means nothing is booked and other times are offered.</li>
+      <li>Reads the slot back after it writes. If two landed at once, the earliest wins and the other deletes itself.</li>
+      <li>A retried call gets the same confirmation code, not a second booking.</li>
+    </ol>
+    <p style="margin-top:12px"><a href="https://github.com/nobsai-hq/no-double-booking">Get the free n8n workflow on GitHub</a>. Want it set up on your number? Text SETUP to <a href="sms:+14707792869">(470) 779-2869</a></p>
+  </section>
+
+  <section class="card">
+    <h2>Try it: Tuesday, Nov 17</h2>
+    <p class="muted">Fake clock: Monday, Nov 16, 9:30 AM Eastern. Open 9 to 5, lunch 12 to 1, one hour slots. The owner already has 9 AM blocked.</p>
+    <div class="row">
+      <button id="bCheck" type="button">Alex checks Tuesday</button>
+      <button id="bBook" type="button">Alex books 10 AM</button>
+      <button id="bRetry" type="button">Platform retries Alex's booking</button>
+      <button id="bSam" type="button">Sam asks for 10 AM</button>
+    </div>
+    <div class="row">
+      <button class="primary" id="bRace" type="button">Two callers book 3 PM at the same moment</button>
+    </div>
+    <div class="row">
+      <label class="toggle"><input type="checkbox" id="safe" checked> Read back after write (the fix). Turn off to see the double booking.</label>
+    </div>
+    <div class="row"><button id="bReset" type="button">Reset</button></div>
+  </section>
+
+  <section class="card">
+    <h2>Tuesday's calendar</h2>
+    <div class="slots" id="slots"></div>
+    <p class="muted" style="margin-top:10px">Last answer sent back to the voice agent (Vapi format):</p>
+    <pre id="json">Press a button.</pre>
+  </section>
+
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>Sandbox log</h2>
+    <p class="muted" id="empty">Nothing yet. Start with Alex checks Tuesday, or press the two callers button.</p>
+    <table id="log" hidden>
+      <thead><tr><th>#</th><th>Who</th><th>Result</th><th>What the agent hears</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<div class="cta">
+  <p><strong>Want it set up on your number? Text SETUP to <a href="sms:+14707792869">(470) 779-2869</a></strong></p>
+  <p class="muted">The workflow is free. If you want it wired to your phone agent and your real calendar, send that text and I will follow up.</p>
+</div>
+
+<footer>
+  Built by Bobby Ve, No BS AI. <a href="https://nobsai.com">nobsai.com</a>. More free builds:
+  <a href="https://demo.nobsai.com">call flow demo</a>,
+  <a href="https://github.com/nobsai-hq/missed-call-text-back">missed-call text-back</a>,
+  <a href="https://github.com/nobsai-hq/end-of-call-to-crm">end of call to CRM</a>,
+  <a href="https://github.com/nobsai-hq/owner-alert-cutoff">owner alert and follow-up cutoff</a>.
+  Want it set up on your number? Text SETUP to <a href="sms:+14707792869">(470) 779-2869</a>
+</footer>
+
+<script>
+/*LOGIC*/
+(function () {
+  var S = NB.normSettings({ open_days: '1,2,3,4,5,6', open_time: '09:00', close_time: '17:00', break_time: '12:00-13:00', slot_minutes: 60, lead_minutes: 60, max_offer: 3, timezone: 'America/New_York' });
+  var NOW = Date.parse('2026-11-16T09:30:00-05:00');
+  var TZ = S.timezone;
+  var events, ledger, n, logN;
+  var tbody = document.querySelector('#log tbody'), table = document.getElementById('log'), empty = document.getElementById('empty');
+
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function busy() { return events.map(function (e) { return { start: e.start, end: e.end }; }); }
+  function call(who, kind, args, tc) { return { kind: kind, name: kind, args: args, toolCallId: tc, callId: 'call-' + who, phone: '' }; }
+  function show(tc, text, isErr) {
+    var r = NB.buildResponse('vapi', [{ toolCallId: tc, text: text, is_error: !!isErr }]);
+    document.getElementById('json').textContent = JSON.stringify(r, null, 2);
+  }
+  function log(who, result, cls, text) {
+    logN++; empty.hidden = true; table.hidden = false;
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td>' + logN + '</td><td>' + esc(who) + '</td><td class="' + cls + '">' + esc(result) + '</td><td>' + esc(text) + '</td>';
+    tbody.insertBefore(tr, tbody.firstChild);
+    render();
+  }
+  function createEvent(d, who, createdMs) {
+    n++;
+    var ev = { id: 'ev' + n, created: new Date(createdMs).toISOString(), start: d.start, end: d.end, key: d.key, who: who };
+    events.push(ev);
+    return ev;
+  }
+  function overlapping(d) {
+    var s0 = Date.parse(d.start), s1 = Date.parse(d.end);
+    return events.filter(function (e) { return Date.parse(e.start) < s1 && s0 < Date.parse(e.end); });
+  }
+  function finish(d, ev, who) {
+    var v = NB.verifyWinner(ev, overlapping(d));
+    if (v.outcome !== 'won') events = events.filter(function (e) { return e.id !== ev.id; });
+    if (v.outcome !== 'lost') ledger[d.key] = { code: d.code, start: d.start };
+    return { outcome: v.outcome, text: NB.finalText(d, v.outcome, S) };
+  }
+  // One full booking run, the way the workflow does it.
+  function book(who, start, tc) {
+    var c = call(who, 'book', { start: start, name: who }, tc);
+    var d = NB.decide(c, S, busy(), ledger, NOW);
+    if (d.action !== 'create') { show(tc, d.text, d.action === 'error'); log(who, d.action, d.action === 'duplicate' ? 'k-dup' : 'k-bad', d.text); return; }
+    var ev = createEvent(d, who, Date.now());
+    var f = finish(d, ev, who);
+    show(tc, f.text); log(who, f.outcome === 'won' ? 'booked' : f.outcome, f.outcome === 'won' ? 'k-new' : 'k-dup', f.text);
+  }
+
+  document.getElementById('bCheck').onclick = function () {
+    var d = NB.decide(call('Alex', 'check', { date: '2026-11-17' }, 'tc-check'), S, busy(), ledger, NOW);
+    show('tc-check', d.text); log('Alex', 'check', 'k-new', d.text);
+  };
+  document.getElementById('bBook').onclick = function () { book('Alex', '2026-11-17T10:00:00-05:00', 'tc-book-1'); };
+  document.getElementById('bRetry').onclick = function () { book('Alex', '2026-11-17T10:00:00-05:00', 'tc-book-2'); };
+  document.getElementById('bSam').onclick = function () { book('Sam', '2026-11-17T10:00:00-05:00', 'tc-sam'); };
+  document.getElementById('bRace').onclick = function () {
+    var safe = document.getElementById('safe').checked;
+    var start = '2026-11-17T15:00:00-05:00';
+    // Both runs read the calendar before either one writes.
+    var snap = busy();
+    var a = NB.decide(call('Jordan', 'book', { start: start, name: 'Jordan' }, 'tc-j'), S, snap, ledger, NOW);
+    var b = NB.decide(call('Riley', 'book', { start: start, name: 'Riley' }, 'tc-r'), S, snap, ledger, NOW);
+    if (a.action !== 'create') { show('tc-j', a.text); log('Jordan', a.action, 'k-bad', a.text + ' (Press Reset to try the race again.)'); return; }
+    log('Jordan and Riley', 'both checked', 'k-dup', 'Both runs read the calendar at the same moment. 3 PM looks free to both.');
+    var t = Date.now();
+    var ea = createEvent(a, 'Jordan', t), eb = createEvent(b, 'Riley', t + 80);
+    if (!safe) {
+      ledger[a.key] = { code: a.code, start: a.start }; ledger[b.key] = { code: b.code, start: b.start };
+      log('Jordan', 'booked', 'k-new', NB.finalText(a, 'won', S));
+      log('Riley', 'booked', 'k-bad', NB.finalText(b, 'won', S) + ' Double booked: two people now have 3 PM.');
+      show('tc-r', NB.finalText(b, 'won', S));
+      return;
+    }
+    var fa = finish(a, ea, 'Jordan'), fb = finish(b, eb, 'Riley');
+    log('Jordan', fa.outcome === 'won' ? 'booked' : fa.outcome, 'k-new', fa.text);
+    log('Riley', fb.outcome === 'won' ? 'booked' : fb.outcome, 'k-dup', fb.text + ' (Sandbox note: its copy was deleted after the read back.)');
+    show('tc-r', fb.text);
+  };
+  document.getElementById('bReset').onclick = reset;
+
+  function render() {
+    var box = document.getElementById('slots'); box.innerHTML = '';
+    for (var h = 9; h < 17; h++) {
+      var ms = NB.localToMs(2026, 11, 17, h, 0, TZ), e1 = ms + 3600000;
+      var here = events.filter(function (e) { return Date.parse(e.start) < e1 && ms < Date.parse(e.end); });
+      var cls = 's-open', label = 'Open';
+      if (h === 12) { cls = 's-closed'; label = 'Lunch'; }
+      else if (here.length > 1) { cls = 's-double'; label = 'DOUBLE: ' + here.map(function (e) { return e.who; }).join(' + '); }
+      else if (here.length === 1) { cls = here[0].who === 'Owner' ? 's-owner' : 's-booked'; label = here[0].who === 'Owner' ? 'Owner blocked' : 'Booked: ' + here[0].who; }
+      var div = document.createElement('div'); div.className = 'slot ' + cls;
+      div.innerHTML = '<b>' + esc(NB.speakTime(ms, TZ)) + '</b>' + esc(label);
+      box.appendChild(div);
+    }
+  }
+  function reset() {
+    events = [{ id: 'owner1', created: '2026-11-10T12:00:00Z', start: '2026-11-17T09:00:00-05:00', end: '2026-11-17T10:00:00-05:00', key: '', who: 'Owner' }];
+    ledger = {}; n = 0; logN = 0;
+    tbody.innerHTML = ''; table.hidden = true; empty.hidden = false;
+    document.getElementById('json').textContent = 'Press a button.';
+    render();
+  }
+  reset();
+})();
+</script>
+</body>
+</html>
