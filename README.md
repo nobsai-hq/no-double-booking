@@ -29,7 +29,7 @@ Source: https://community.n8n.io/t/retell-ai-mcp-n8n-an-ai-receptionist-that-boo
 
 Three different things break here:
 
-1. **"No result returned."** Vapi only reads the answer if it is HTTP 200 and shaped like `{ "results": [ { "toolCallId": "...", "result": "one flat string" } ] }`. An object, a missing `toolCallId`, or a non-200 code and the agent says nothing useful.
+1. **"No result returned."** Per Vapi's docs, the answer must come back with HTTP 200 (any other status shows up as "No result returned"), as `{ "results": [ { "toolCallId": "...", "result": "..." } ] }`, where `result` is one flat string, not an object.
 2. **Stale check.** The agent checks availability, chats for a minute, then books. Someone else may have taken that time in between.
 3. **Two at once.** Two calls (or one call plus a retry) hit the last slot within a second. Both see it free. Both book. Google Calendar has no lock to stop that.
 
